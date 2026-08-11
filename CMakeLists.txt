@@ -19,6 +19,15 @@ target_include_directories(hypertron_protocol PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
+add_library(hypertron_agent_core STATIC
+  src/agent_runtime.cpp
+  src/astrall_sdk_adapter.cpp)
+target_include_directories(hypertron_agent_core PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(hypertron_agent_core PUBLIC
+  hypertron_protocol Threads::Threads)
+
 if(BUILD_TESTING)
   find_package(GTest REQUIRED)
 
@@ -36,6 +45,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_robot_controller PRIVATE
     hypertron_protocol GTest::gtest_main Threads::Threads)
   add_test(NAME robot_controller COMMAND test_robot_controller)
+
+  add_executable(test_agent_runtime test/test_agent_runtime.cpp)
+  target_link_libraries(test_agent_runtime PRIVATE
+    hypertron_agent_core GTest::gtest_main Threads::Threads)
+  add_test(NAME agent_runtime COMMAND test_agent_runtime)
 endif()
 
 if(BUILD_ROS2_BRIDGE)
@@ -74,5 +88,30 @@ if(BUILD_AGENT)
   if(NOT ASTRALL_SDK_ROOT)
     message(FATAL_ERROR "BUILD_AGENT requires -DASTRALL_SDK_ROOT=<sdk-root>")
   endif()
-  message(STATUS "ASTRALL agent build enabled with SDK root: ${ASTRALL_SDK_ROOT}")
+  find_path(ASTRALL_INCLUDE_DIR interface.h
+    PATHS
+      "${ASTRALL_SDK_ROOT}/include"
+      "${ASTRALL_SDK_ROOT}/C++/include"
+    NO_DEFAULT_PATH REQUIRED)
+  find_library(ASTRALL_LIBRARY
+    NAMES ASTRALL_SDK
+    PATHS
+      "${ASTRALL_SDK_ROOT}/lib/linux/${CMAKE_SYSTEM_PROCESSOR}"
+      "${ASTRALL_SDK_ROOT}/lib/linux/ARM64"
+      "${ASTRALL_SDK_ROOT}/lib/linux/x86_64"
+      "${ASTRALL_SDK_ROOT}/C++/lib/linux/${CMAKE_SYSTEM_PROCESSOR}"
+      "${ASTRALL_SDK_ROOT}/C++/lib/linux/ARM64"
+      "${ASTRALL_SDK_ROOT}/C++/lib/linux/x86_64"
+    NO_DEFAULT_PATH REQUIRED)
+  target_compile_definitions(hypertron_agent_core PRIVATE
+    HYPERTRON_WITH_ASTRALL_SDK=1)
+  target_include_directories(hypertron_agent_core PRIVATE
+    "${ASTRALL_INCLUDE_DIR}")
+  target_link_libraries(hypertron_agent_core PUBLIC "${ASTRALL_LIBRARY}")
+
+  add_executable(hypertron_bridge_agent src/agent_main.cpp)
+  target_link_libraries(hypertron_bridge_agent PRIVATE
+    hypertron_agent_core Threads::Threads)
+  install(TARGETS hypertron_bridge_agent DESTINATION bin)
+  message(STATUS "ASTRALL agent SDK: ${ASTRALL_LIBRARY}")
 endif()
