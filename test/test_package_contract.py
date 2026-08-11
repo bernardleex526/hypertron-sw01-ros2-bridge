@@ -87,3 +87,25 @@ def test_operator_documentation_covers_deployment_safety_and_sources() -> None:
         "AstrallSportData",
     ):
         assert token in manual
+
+
+def test_readme_contains_complete_public_commissioning_sop() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    required = (
+        "## 实机前必要条件",
+        "## SOP 0：安全与厂家资料准备",
+        "## SOP 1：网络与 SSH 信任建立",
+        "## SOP 2：PC 端 ROS2 编译",
+        "## SOP 3：机器人端 ARM64 agent 部署",
+        "## SOP 4：配置文件逐项设置",
+        "## SOP 5：启动、状态门禁与首次低速运动",
+        "## SOP 6：断线与故障恢复",
+        "ROS2 指令到 ASTRALL 对照",
+        "CMD_VELOCITY",
+        "AstrallMove(vx, vy, vyaw)",
+        "<ROBOT_IP>",
+        "odometry_scale_verified=false",
+        "30 分钟",
+        "不能声称已通过真实 SW01 实机验证",
+    )
+    assert all(token in readme for token in required)
