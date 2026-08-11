@@ -9,6 +9,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+install(FILES README.md SW01_MANUAL_NOTES.md
+  DESTINATION share/${PROJECT_NAME})
+
 include(CTest)
 find_package(Threads REQUIRED)
 
@@ -151,5 +154,6 @@ if(BUILD_AGENT)
   target_link_libraries(hypertron_bridge_agent PRIVATE
     hypertron_agent_core Threads::Threads)
   install(TARGETS hypertron_bridge_agent DESTINATION bin)
+  install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
   message(STATUS "ASTRALL agent SDK: ${ASTRALL_LIBRARY}")
 endif()

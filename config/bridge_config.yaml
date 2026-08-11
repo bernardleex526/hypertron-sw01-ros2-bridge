@@ -11,7 +11,9 @@ hypertron_bridge:
       remote_command: "/opt/hypertron/bin/hypertron_bridge_agent --stdio --config /opt/hypertron/config/bridge_config.yaml"
       connect_timeout_ms: 5000
       keepalive_interval_ms: 1000
+      ping_interval_ms: 200
       application_timeout_ms: 500
+      reconnect_initial_delay_ms: 1000
       reconnect_max_delay_ms: 30000
 
     astrall:

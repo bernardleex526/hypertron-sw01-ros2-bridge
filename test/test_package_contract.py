@@ -44,3 +44,35 @@ def test_ros_bridge_source_declares_required_graph_interfaces() -> None:
         "reject_joint_command",
     ):
         assert token in source
+
+
+def test_operator_documentation_covers_deployment_safety_and_sources() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    manual = (ROOT / "SW01_MANUAL_NOTES.md").read_text(encoding="utf-8")
+    for token in (
+        "ROS2 Humble",
+        "agent-only",
+        "ARM64",
+        "known_hosts",
+        "/cmd_vel",
+        "/joint_commands",
+        "/emergency_stop",
+        "断线",
+        "第 26 页",
+        "ros2 topic list",
+        "ros2 service call",
+        "unitreerobotics/unitree_ros2",
+        "DeepRoboticsLab/Lite3_ROS",
+    ):
+        assert token in readme
+    for token in (
+        "AstrallSdkInit",
+        "AstrallHeartbeat",
+        "AstrallMove",
+        "UDP 6000",
+        "UDP 6100",
+        "UDP 6101",
+        "AstrallImuData",
+        "AstrallSportData",
+    ):
+        assert token in manual

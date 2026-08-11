@@ -167,8 +167,12 @@ struct HypertronBridgeNode::Impl {
         node.declare_parameter<int>("ssh.connect_timeout_ms", 5000));
     config.keepalive_interval = std::chrono::milliseconds(
         node.declare_parameter<int>("ssh.keepalive_interval_ms", 1000));
+    config.ping_interval = std::chrono::milliseconds(
+        node.declare_parameter<int>("ssh.ping_interval_ms", 200));
     config.application_timeout = std::chrono::milliseconds(
         node.declare_parameter<int>("ssh.application_timeout_ms", 500));
+    config.reconnect_initial_delay = std::chrono::milliseconds(
+        node.declare_parameter<int>("ssh.reconnect_initial_delay_ms", 1000));
     config.reconnect_max_delay = std::chrono::milliseconds(
         node.declare_parameter<int>("ssh.reconnect_max_delay_ms", 30000));
     config.queue_capacity = static_cast<std::size_t>(
