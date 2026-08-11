@@ -13,6 +13,7 @@ include(CTest)
 find_package(Threads REQUIRED)
 
 add_library(hypertron_protocol STATIC
+  src/data_mapping.cpp
   src/protocol_handler.cpp
   src/robot_controller.cpp)
 target_include_directories(hypertron_protocol PUBLIC
@@ -62,6 +63,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_ssh_tunnel PRIVATE
     hypertron_ssh GTest::gtest_main Threads::Threads)
   add_test(NAME ssh_tunnel COMMAND test_ssh_tunnel)
+
+  add_executable(test_data_receiver test/test_data_receiver.cpp)
+  target_link_libraries(test_data_receiver PRIVATE
+    hypertron_protocol GTest::gtest_main Threads::Threads)
+  add_test(NAME data_receiver COMMAND test_data_receiver)
 endif()
 
 if(BUILD_ROS2_BRIDGE)
