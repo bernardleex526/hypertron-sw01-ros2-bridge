@@ -12,7 +12,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 include(CTest)
 find_package(Threads REQUIRED)
 
-add_library(hypertron_protocol STATIC src/protocol_handler.cpp)
+add_library(hypertron_protocol STATIC
+  src/protocol_handler.cpp
+  src/robot_controller.cpp)
 target_include_directories(hypertron_protocol PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -29,6 +31,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_protocol_handler PRIVATE
     hypertron_protocol GTest::gtest_main Threads::Threads)
   add_test(NAME protocol_handler COMMAND test_protocol_handler)
+
+  add_executable(test_robot_controller test/test_robot_controller.cpp)
+  target_link_libraries(test_robot_controller PRIVATE
+    hypertron_protocol GTest::gtest_main Threads::Threads)
+  add_test(NAME robot_controller COMMAND test_robot_controller)
 endif()
 
 if(BUILD_ROS2_BRIDGE)
