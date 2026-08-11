@@ -12,6 +12,15 @@ namespace {
 
 constexpr std::array<std::uint8_t, 4> kMagic{{'H', 'T', 'B', 'R'}};
 constexpr std::size_t kHeaderSize = 28U;
+constexpr std::uint32_t kKnownCapabilities =
+    CapabilityImu | CapabilitySport | CapabilityOdometry | CapabilityCamera |
+    CapabilityJoint | CapabilitySystemState;
+
+void validate_capabilities(std::uint32_t capabilities) {
+  if ((capabilities & ~kKnownCapabilities) != 0U) {
+    throw ProtocolError("capability bitset contains reserved bits");
+  }
+}
 
 class Writer {
  public:
@@ -297,7 +306,9 @@ std::vector<Frame> ProtocolHandler::feed(const std::uint8_t* bytes,
   if (size != 0U && bytes == nullptr) {
     throw std::invalid_argument("null input with non-zero size");
   }
-  buffer_.insert(buffer_.end(), bytes, bytes + size);
+  if (size != 0U) {
+    buffer_.insert(buffer_.end(), bytes, bytes + size);
+  }
   std::vector<Frame> frames;
   while (buffer_.size() >= kHeaderSize) {
     if (!std::equal(kMagic.begin(), kMagic.end(), buffer_.begin())) {
@@ -429,12 +440,12 @@ bool RobotStatePayload::operator==(const RobotStatePayload& o) const {
 }
 bool CameraChunkPayload::operator==(const CameraChunkPayload& o) const {
   return stream_id == o.stream_id &&
-         datagram_sequence == o.datagram_sequence &&
          receive_time_ns == o.receive_time_ns &&
-         keyframe_hint == o.keyframe_hint && data == o.data;
+         datagram_sequence == o.datagram_sequence && data == o.data;
 }
 
 std::vector<std::uint8_t> encode_hello(const HelloPayload& p) {
+  validate_capabilities(p.capabilities);
   Writer w;
   w.u8(p.min_version);
   w.u8(p.max_version);
@@ -452,6 +463,7 @@ HelloPayload decode_hello(const std::vector<std::uint8_t>& bytes) {
     throw ProtocolError("HELLO reserved field is non-zero");
   }
   p.capabilities = r.u32();
+  validate_capabilities(p.capabilities);
   p.instance_nonce = r.u32();
   r.finish();
   if (p.min_version == 0U || p.min_version > p.max_version) {
@@ -460,6 +472,7 @@ HelloPayload decode_hello(const std::vector<std::uint8_t>& bytes) {
   return p;
 }
 std::vector<std::uint8_t> encode_hello_ack(const HelloAckPayload& p) {
+  validate_capabilities(p.capabilities);
   Writer w;
   w.u8(p.selected_version);
   w.u8(0);
@@ -477,6 +490,7 @@ HelloAckPayload decode_hello_ack(const std::vector<std::uint8_t>& bytes) {
     throw ProtocolError("HELLO_ACK reserved field is non-zero");
   }
   p.capabilities = r.u32();
+  validate_capabilities(p.capabilities);
   p.instance_nonce = r.u32();
   p.sdk_version = r.text();
   r.finish();
@@ -652,9 +666,8 @@ RobotStatePayload decode_robot_state(const std::vector<std::uint8_t>& bytes) {
 std::vector<std::uint8_t> encode_camera_chunk(const CameraChunkPayload& p) {
   Writer w;
   w.u32(p.stream_id);
-  w.u32(p.datagram_sequence);
   w.u64(p.receive_time_ns);
-  w.u8(p.keyframe_hint ? 1U : 0U);
+  w.u32(p.datagram_sequence);
   w.raw(p.data);
   return w.finish();
 }
@@ -662,13 +675,8 @@ CameraChunkPayload decode_camera_chunk(const std::vector<std::uint8_t>& bytes) {
   Reader r(bytes);
   CameraChunkPayload p;
   p.stream_id = r.u32();
-  p.datagram_sequence = r.u32();
   p.receive_time_ns = r.u64();
-  const auto key = r.u8();
-  if (key > 1U) {
-    throw ProtocolError("camera keyframe hint is not boolean");
-  }
-  p.keyframe_hint = key == 1U;
+  p.datagram_sequence = r.u32();
   p.data = r.rest();
   r.finish();
   return p;
@@ -782,8 +790,8 @@ std::optional<PointCloudPacket> parse_point_cloud_packet(
 
     PointCloudPacket packet;
     packet.device_time = read_u64_le(datagram.data() + time_offset);
-    packet.frame_index = read_u32_le(datagram.data() + frame_offset);
-    packet.data_index = read_u32_le(datagram.data() + data_offset);
+    packet.total_points = read_u32_le(datagram.data() + frame_offset);
+    packet.packet_index = read_u32_le(datagram.data() + data_offset);
     packet.points.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
       const auto* point = datagram.data() + points_offset + i * kPointSize;

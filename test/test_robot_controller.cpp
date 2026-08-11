@@ -72,6 +72,7 @@ TEST(RobotController, MapsAllDocumentedModesCaseInsensitively) {
   EXPECT_EQ(controller.request_mode("auto_charge").mode, 0xA105U);
   EXPECT_EQ(controller.request_mode("exit_charge").mode, 0xA106U);
   EXPECT_EQ(controller.request_mode("recovery").mode, 0xA1FFU);
+  EXPECT_EQ(controller.request_mode("recover").mode, 0xA1FFU);
   EXPECT_FALSE(controller.request_mode("run").accepted);
 }
 

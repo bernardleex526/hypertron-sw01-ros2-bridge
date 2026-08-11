@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(hypertron_ros2_bridge VERSION 0.1.0 LANGUAGES CXX)
+project(hypertron_ros2_bridge VERSION 0.1.0 LANGUAGES C CXX)
 
 option(BUILD_ROS2_BRIDGE "Build the PC-side ROS2 bridge node" ON)
 option(BUILD_AGENT "Build the robot-side ASTRALL agent" OFF)
@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-install(FILES README.md SW01_MANUAL_NOTES.md
+install(FILES README.md SW01_MANUAL_NOTES.md HTBR_PROTOCOL.md REVIEW.md
   DESTINATION share/${PROJECT_NAME})
 
 include(CTest)

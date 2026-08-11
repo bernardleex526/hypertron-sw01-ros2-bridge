@@ -104,7 +104,7 @@ OdometrySample to_odometry_sample(const OdometryPayload& payload,
   require_finite(payload.orientation, "odometry quaternion");
   OdometrySample sample;
   sample.timestamp_ns = resolve_timestamp(payload.device_time, receive_time_ns,
-                                          config.timestamp_source);
+                                          config.odometry_timestamp_source);
   sample.frame_id = config.odom_frame;
   sample.child_frame_id = config.base_frame;
   sample.position = payload.position;

@@ -9,6 +9,7 @@
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -65,6 +66,9 @@ struct HypertronBridgeNode::Impl {
         "safety.command_deadman_ms", 100);
     mode_timeout = std::chrono::milliseconds(
         node.declare_parameter<int>("safety.mode_timeout_ms", 10000));
+    if (mode_timeout.count() <= 0) {
+      throw std::invalid_argument("safety.mode_timeout_ms must be positive");
+    }
     controller = std::make_unique<RobotController>(
         ControllerConfig{std::chrono::milliseconds(deadman_ms)}, clock);
     receiver = std::make_unique<DataReceiver>(node, receiver_config);
@@ -80,12 +84,12 @@ struct HypertronBridgeNode::Impl {
         "topics.emergency_stop", "/emergency_stop");
 
     cmd_vel = node.create_subscription<geometry_msgs::msg::Twist>(
-        cmd_vel_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
+        cmd_vel_topic, rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
         [this](geometry_msgs::msg::Twist::ConstSharedPtr message) {
           on_velocity(*message);
         });
     joint_commands = node.create_subscription<sensor_msgs::msg::JointState>(
-        joint_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
+        joint_topic, rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
         [this](sensor_msgs::msg::JointState::ConstSharedPtr message) {
           on_joint_command(*message);
         });
@@ -100,6 +104,8 @@ struct HypertronBridgeNode::Impl {
                std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
           on_emergency_stop(request->data, *response);
         });
+    mode_watchdog = node.create_wall_timer(
+        std::chrono::milliseconds(100), [this] { check_mode_timeout(); });
 
     publish_connection_state();
     if (!receiver_config.odometry_scale_verified) {
@@ -136,10 +142,19 @@ struct HypertronBridgeNode::Impl {
   std::unordered_map<std::uint32_t,
                      std::shared_ptr<std::promise<RequestResult>>>
       pending;
+  struct PendingMode {
+    std::uint32_t sequence{};
+    std::string name;
+    std::chrono::steady_clock::time_point deadline;
+  };
+  std::mutex mode_mutex;
+  std::optional<PendingMode> pending_mode;
+  std::uint32_t hello_nonce{};
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_commands;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_mode;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr emergency_stop;
+  rclcpp::TimerBase::SharedPtr mode_watchdog;
 
   SshConfig read_ssh_config() {
     SshConfig config;
@@ -171,14 +186,26 @@ struct HypertronBridgeNode::Impl {
         node.declare_parameter<int>("ssh.ping_interval_ms", 200));
     config.application_timeout = std::chrono::milliseconds(
         node.declare_parameter<int>("ssh.application_timeout_ms", 500));
+    config.agent_startup_timeout = std::chrono::milliseconds(
+        node.declare_parameter<int>("ssh.agent_startup_timeout_ms", 65000));
     config.reconnect_initial_delay = std::chrono::milliseconds(
         node.declare_parameter<int>("ssh.reconnect_initial_delay_ms", 1000));
     config.reconnect_max_delay = std::chrono::milliseconds(
         node.declare_parameter<int>("ssh.reconnect_max_delay_ms", 30000));
-    config.queue_capacity = static_cast<std::size_t>(
-        node.declare_parameter<int>("safety.queue_capacity", 64));
-    config.max_payload = static_cast<std::uint32_t>(
-        node.declare_parameter<int>("safety.max_payload_bytes", 8388608));
+    const auto queue_capacity =
+        node.declare_parameter<int>("safety.queue_capacity", 64);
+    const auto max_payload =
+        node.declare_parameter<int>("safety.max_payload_bytes", 8388608);
+    if (queue_capacity <= 0 || queue_capacity > 1000000) {
+      throw std::invalid_argument(
+          "safety.queue_capacity must be in [1, 1000000]");
+    }
+    if (max_payload <= 0 || max_payload > 64 * 1024 * 1024) {
+      throw std::invalid_argument(
+          "safety.max_payload_bytes must be in [1, 67108864]");
+    }
+    config.queue_capacity = static_cast<std::size_t>(queue_capacity);
+    config.max_payload = static_cast<std::uint32_t>(max_payload);
     return config;
   }
 
@@ -204,6 +231,9 @@ struct HypertronBridgeNode::Impl {
         "topics.camera", "/camera/image_raw");
     config.timestamp_source = timestamp_source(node.declare_parameter<std::string>(
         "imu.timestamp_source", "receive"));
+    config.odometry_timestamp_source = timestamp_source(
+        node.declare_parameter<std::string>("odometry.timestamp_source",
+                                            "receive"));
     config.quaternion_order =
         node.declare_parameter<std::string>("imu.quaternion_order", "xyzw") ==
                 "wxyz"
@@ -274,8 +304,29 @@ struct HypertronBridgeNode::Impl {
                   name.c_str(), decision.reason.c_str());
       return;
     }
-    if (!tunnel->send(command_frame(MessageType::CmdMode,
-                                    encode_mode({decision.mode})))) {
+    auto frame = command_frame(MessageType::CmdMode,
+                               encode_mode({decision.mode}));
+    bool busy = false;
+    {
+      std::lock_guard<std::mutex> lock(mode_mutex);
+      if (pending_mode) {
+        busy = true;
+      } else {
+        pending_mode = PendingMode{frame.sequence, name,
+                                   std::chrono::steady_clock::now() +
+                                       mode_timeout};
+      }
+    }
+    if (busy) {
+      update_error(
+          "robot mode request rejected: another transition is pending");
+      return;
+    }
+    if (!tunnel->send(std::move(frame))) {
+      {
+        std::lock_guard<std::mutex> lock(mode_mutex);
+        pending_mode.reset();
+      }
       update_error("robot mode dropped because SSH agent is disconnected");
     }
   }
@@ -324,6 +375,13 @@ struct HypertronBridgeNode::Impl {
         if (hello.selected_version != kBridgeProtocolVersion) {
           throw ProtocolError("agent selected an incompatible HTBR version");
         }
+        if (hello.instance_nonce != hello_nonce) {
+          throw ProtocolError("agent HELLO_ACK nonce does not match this session");
+        }
+        if ((hello.capabilities & CapabilityJoint) != 0U) {
+          throw ProtocolError(
+              "agent advertised unsupported JOINT capability semantics");
+        }
         {
           std::lock_guard<std::mutex> lock(state_mutex);
           connection.agent_connected = true;
@@ -336,16 +394,19 @@ struct HypertronBridgeNode::Impl {
       }
       if (frame.type == MessageType::Ack) {
         const auto ack = decode_ack(frame.payload);
+        if (resolve_mode(ack.request_sequence, true, ack.text)) return;
         resolve_pending(ack.request_sequence,
                         {true, ack.result_code, ack.text});
         return;
       }
       if (frame.type == MessageType::Error) {
         const auto error = decode_error(frame.payload);
+        const auto was_mode =
+            resolve_mode(error.request_sequence, false, error.text);
         resolve_pending(error.request_sequence,
                         {false, static_cast<std::uint16_t>(error.error),
                          error.text});
-        update_error(error.text);
+        if (!was_mode) update_error(error.text);
         return;
       }
       if (frame.type == MessageType::Ping) {
@@ -379,11 +440,13 @@ struct HypertronBridgeNode::Impl {
         connection.last_error.clear();
       }
       publish_connection_state();
+      hello_nonce = static_cast<std::uint32_t>(steady_now_ns()) ^
+                    next_sequence.load() ^ 0x48544252U;
       const HelloPayload hello{kBridgeProtocolVersion, kBridgeProtocolVersion,
                                CapabilityImu | CapabilitySport |
                                    CapabilityOdometry | CapabilitySystemState |
                                    CapabilityCamera,
-                               next_sequence.load() ^ 0x48544252U};
+                                hello_nonce};
       tunnel->send(command_frame(MessageType::Hello, encode_hello(hello)));
       return;
     }
@@ -393,9 +456,11 @@ struct HypertronBridgeNode::Impl {
         std::lock_guard<std::mutex> lock(state_mutex);
         connection.ssh_connected = false;
         connection.agent_connected = false;
+        connection.protocol_rx_drops = tunnel->protocol_drops();
         connection.last_error = detail;
       }
       controller->update_robot_state({});
+      fail_mode(detail);
       fail_pending(detail);
       publish_connection_state();
     }
@@ -424,6 +489,50 @@ struct HypertronBridgeNode::Impl {
     for (auto& item : local) {
       item.second->set_value({false, 0, reason});
     }
+  }
+
+  bool resolve_mode(std::uint32_t sequence, bool success,
+                    const std::string& detail) {
+    std::string name;
+    {
+      std::lock_guard<std::mutex> lock(mode_mutex);
+      if (!pending_mode || pending_mode->sequence != sequence) return false;
+      name = pending_mode->name;
+      pending_mode.reset();
+    }
+    if (success) {
+      RCLCPP_INFO(node.get_logger(), "Robot mode '%s' confirmed: %s",
+                  name.c_str(), detail.c_str());
+    } else {
+      update_error("robot mode '" + name + "' failed: " + detail);
+    }
+    return true;
+  }
+
+  void fail_mode(const std::string& reason) {
+    std::string name;
+    {
+      std::lock_guard<std::mutex> lock(mode_mutex);
+      if (!pending_mode) return;
+      name = pending_mode->name;
+      pending_mode.reset();
+    }
+    update_error("robot mode '" + name + "' failed: " + reason);
+  }
+
+  void check_mode_timeout() {
+    std::string name;
+    {
+      std::lock_guard<std::mutex> lock(mode_mutex);
+      if (!pending_mode ||
+          std::chrono::steady_clock::now() < pending_mode->deadline) {
+        return;
+      }
+      name = pending_mode->name;
+      pending_mode.reset();
+    }
+    update_error("robot mode '" + name +
+                 "' timed out waiting for stable-state ACK");
   }
 
   void update_error(const std::string& error) {

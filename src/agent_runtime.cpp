@@ -32,6 +32,13 @@ ControllerStatus controller_status(const SdkSnapshot& snapshot) {
 }  // namespace
 
 struct AgentRuntime::Impl {
+  struct ModeRequest {
+    std::uint32_t sequence{};
+    std::uint16_t mode{};
+    std::uint16_t expected_status{};
+    std::string name;
+  };
+
   Impl(AgentConfig config_value, IAstrallSdk& sdk_value,
        IByteStream& stream_value, IMonotonicClock& clock_value,
        AgentUdpSources udp_value)
@@ -42,12 +49,17 @@ struct AgentRuntime::Impl {
         udp(udp_value),
         controller({config.command_deadman}, clock),
         control_output(config.output_queue_capacity, OverflowPolicy::RejectNew),
-        telemetry_output(config.output_queue_capacity,
-                         OverflowPolicy::DropOldest),
+        state_output(config.output_queue_capacity, OverflowPolicy::RejectNew),
+        odometry_output(config.output_queue_capacity, OverflowPolicy::DropOldest),
+        sensor_output(config.output_queue_capacity, OverflowPolicy::DropOldest),
+        camera_output(2U, OverflowPolicy::DropOldest),
+        mode_requests(config.output_queue_capacity, OverflowPolicy::RejectNew),
         decoder(config.max_payload) {
     if (config.heartbeat_period.count() <= 0 ||
         config.motion_period.count() <= 0 || config.state_period.count() <= 0 ||
-        config.application_timeout.count() <= 0) {
+        config.application_timeout.count() <= 0 ||
+        config.mode_timeout.count() <= 0 ||
+        config.mode_poll_period.count() <= 0) {
       throw std::invalid_argument("agent periods must be positive");
     }
   }
@@ -59,7 +71,11 @@ struct AgentRuntime::Impl {
   AgentUdpSources udp;
   RobotController controller;
   ThreadSafeQueue<Frame> control_output;
-  ThreadSafeQueue<Frame> telemetry_output;
+  ThreadSafeQueue<Frame> state_output;
+  ThreadSafeQueue<Frame> odometry_output;
+  ThreadSafeQueue<Frame> sensor_output;
+  ThreadSafeQueue<Frame> camera_output;
+  ThreadSafeQueue<ModeRequest> mode_requests;
   ProtocolHandler decoder;
   std::mutex sdk_mutex;
   std::atomic_bool stop{false};
@@ -70,7 +86,18 @@ struct AgentRuntime::Impl {
   std::atomic<std::uint32_t> last_velocity_sequence{0};
   std::mutex ping_mutex;
   IMonotonicClock::time_point last_ping{};
+  std::mutex error_mutex;
   std::string last_error;
+
+  void set_last_error(std::string value) {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    last_error = std::move(value);
+  }
+
+  std::string get_last_error() {
+    std::lock_guard<std::mutex> lock(error_mutex);
+    return last_error;
+  }
 
   Frame make_frame(MessageType type, std::vector<std::uint8_t> payload = {}) {
     return {type, next_sequence.fetch_add(1), to_nanoseconds(clock.now()),
@@ -79,13 +106,16 @@ struct AgentRuntime::Impl {
 
   void enqueue_control(Frame frame) {
     if (!control_output.push(std::move(frame))) {
-      last_error = "control output queue saturated";
+      set_last_error("control output queue saturated");
       stop.store(true);
     }
   }
 
-  void enqueue_telemetry(Frame frame) {
-    telemetry_output.push(std::move(frame));
+  void enqueue_state(Frame frame) {
+    if (!state_output.push(std::move(frame))) {
+      set_last_error("state output queue saturated");
+      stop.store(true);
+    }
   }
 
   SdkCallbacks callbacks() {
@@ -98,19 +128,19 @@ struct AgentRuntime::Impl {
     };
     value.on_imu = [this](ImuPayload payload) {
       try {
-        enqueue_telemetry(make_frame(MessageType::Imu, encode_imu(payload)));
+        sensor_output.push(make_frame(MessageType::Imu, encode_imu(payload)));
       } catch (const std::exception& error) {
-        last_error = error.what();
+        set_last_error(error.what());
       }
     };
     value.on_sport = [this](SportPayload payload) {
       try {
         auto state = controller.status();
         payload.sport_status = state.sport_status;
-        enqueue_telemetry(
+        sensor_output.push(
             make_frame(MessageType::Sport, encode_sport(payload)));
       } catch (const std::exception& error) {
-        last_error = error.what();
+        set_last_error(error.what());
       }
     };
     return value;
@@ -126,16 +156,30 @@ struct AgentRuntime::Impl {
       result = sdk.init(callbacks(), config.init_timeout_ms);
     }
     if (result != kAstrallSuccess) {
-      last_error = "AstrallSdkInit failed: " + std::to_string(result);
+      set_last_error("AstrallSdkInit failed: " + std::to_string(result));
       return false;
     }
     initialized.store(true);
+    {
+      const bool camera = config.camera_enabled && udp.camera != nullptr;
+      const bool lidar = udp.lidar != nullptr || udp.odometry != nullptr;
+      std::lock_guard<std::mutex> lock(sdk_mutex);
+      const auto subscription = sdk.configure_udp_streams(
+          camera, lidar, config.sdk_call_timeout_ms);
+      if (subscription != kAstrallSuccess) {
+        set_last_error("ASTRALL UDP subscription failed: " +
+                       std::to_string(subscription));
+        sdk.deinit();
+        initialized.store(false);
+        return false;
+      }
+    }
     if (config.auto_acquire_control) {
       std::lock_guard<std::mutex> lock(sdk_mutex);
       const auto auth = sdk.acquire_sdk_control(config.sdk_call_timeout_ms);
       if (auth != kAstrallSuccess) {
-        last_error = "ASTRALL control request denied: " +
-                     std::to_string(auth);
+        set_last_error("ASTRALL control request denied: " +
+                       std::to_string(auth));
       }
     }
     refresh_snapshot(false);
@@ -171,12 +215,12 @@ struct AgentRuntime::Impl {
       state.charge_status = snapshot.charge_status;
       state.wheel_speed = snapshot.wheel_speed;
       state.last_velocity_sequence = last_velocity_sequence.load();
-      state.last_error = last_error;
+      state.last_error = get_last_error();
       try {
-        enqueue_telemetry(
+        enqueue_state(
             make_frame(MessageType::RobotState, encode_robot_state(state)));
       } catch (const std::exception& error) {
-        last_error = error.what();
+        set_last_error(error.what());
       }
     }
     return snapshot;
@@ -184,7 +228,7 @@ struct AgentRuntime::Impl {
 
   void send_error(std::uint32_t request, BridgeError code,
                   const std::string& text) {
-    last_error = text;
+    set_last_error(text);
     enqueue_control(make_frame(
         MessageType::Error, encode_error({request, code, text})));
   }
@@ -246,17 +290,51 @@ struct AgentRuntime::Impl {
     }
     if (frame.type == MessageType::CmdMode) {
       const auto requested = decode_mode(frame.payload);
-      std::uint16_t result{};
-      {
-        std::lock_guard<std::mutex> lock(sdk_mutex);
-        result = sdk.set_mode(requested.mode, config.sdk_call_timeout_ms);
+      std::string_view mode_name;
+      std::uint16_t expected_status{};
+      switch (requested.mode) {
+        case 0xA101U:
+          mode_name = "damping";
+          expected_status = 0xB101U;
+          break;
+        case 0xA102U:
+          mode_name = "stand";
+          expected_status = 0xB102U;
+          break;
+        case 0xA103U:
+          mode_name = "down";
+          expected_status = 0xB103U;
+          break;
+        case 0xA104U:
+          mode_name = "move";
+          expected_status = 0xB104U;
+          break;
+        case 0xA105U:
+          mode_name = "auto_charge";
+          expected_status = 0xB107U;
+          break;
+        case 0xA106U:
+          mode_name = "exit_charge";
+          expected_status = 0xB10BU;
+          break;
+        case 0xA1FFU:
+          mode_name = "recover";
+          expected_status = 0xB1FFU;
+          break;
+        default:
+          send_error(frame.sequence, BridgeError::InvalidCommand,
+                     "unknown ASTRALL sport mode code");
+          return;
       }
-      if (result == kAstrallSuccess) {
-        send_ack(frame.sequence, result, "mode command accepted");
-      } else {
-        send_error(frame.sequence, BridgeError::SdkCallFailed,
-                   "AstrallSportModeControl failed: " +
-                       std::to_string(result));
+      const auto decision = controller.request_mode(mode_name);
+      if (!decision.accepted) {
+        send_error(frame.sequence, decision.error, decision.reason);
+        return;
+      }
+      if (!mode_requests.push({frame.sequence, decision.mode, expected_status,
+                               std::string(mode_name)})) {
+        send_error(frame.sequence, BridgeError::InvalidCommand,
+                   "mode request queue is full");
       }
       return;
     }
@@ -305,7 +383,7 @@ struct AgentRuntime::Impl {
         result = sdk.heartbeat(config.sdk_call_timeout_ms);
       }
       if (result != kAstrallSuccess) {
-        last_error = "AstrallHeartbeat failed: " + std::to_string(result);
+        set_last_error("AstrallHeartbeat failed: " + std::to_string(result));
       }
       std::this_thread::sleep_for(config.heartbeat_period);
     }
@@ -324,7 +402,8 @@ struct AgentRuntime::Impl {
           std::lock_guard<std::mutex> lock(sdk_mutex);
           sdk.move(0, 0, 0, config.sdk_call_timeout_ms);
           sdk.set_mode(kAstrallModeDamping, config.sdk_call_timeout_ms);
-          last_error = "PC application heartbeat timed out; damping requested";
+          set_last_error(
+              "PC application heartbeat timed out; damping requested");
         }
       } else {
         const auto velocity = controller.velocity_for_tick().value;
@@ -332,7 +411,7 @@ struct AgentRuntime::Impl {
         const auto result = sdk.move(velocity.vx, velocity.vy, velocity.vyaw,
                                      config.sdk_call_timeout_ms);
         if (result != kAstrallSuccess) {
-          last_error = "AstrallMove failed: " + std::to_string(result);
+          set_last_error("AstrallMove failed: " + std::to_string(result));
         }
       }
       std::this_thread::sleep_for(config.motion_period);
@@ -346,6 +425,61 @@ struct AgentRuntime::Impl {
     }
   }
 
+  void mode_loop() {
+    using namespace std::chrono_literals;
+    while (!stop.load()) {
+      auto request = mode_requests.wait_pop_for(20ms);
+      if (!request) {
+        if (mode_requests.closed()) return;
+        continue;
+      }
+
+      const auto decision = controller.request_mode(request->name);
+      if (!decision.accepted) {
+        send_error(request->sequence, decision.error, decision.reason);
+        continue;
+      }
+
+      std::uint16_t result{};
+      {
+        std::lock_guard<std::mutex> lock(sdk_mutex);
+        result = sdk.set_mode(request->mode, config.sdk_call_timeout_ms);
+      }
+      if (result != kAstrallSuccess) {
+        send_error(request->sequence, BridgeError::SdkCallFailed,
+                   "AstrallSportModeControl failed: " +
+                       std::to_string(result));
+        continue;
+      }
+
+      const auto deadline = std::chrono::steady_clock::now() +
+                            config.mode_timeout;
+      bool completed = false;
+      while (!stop.load() && std::chrono::steady_clock::now() < deadline) {
+        if (controller.emergency_stop_latched() &&
+            request->mode != kAstrallModeDamping) {
+          send_error(request->sequence, BridgeError::EmergencyStopLatched,
+                     "mode transition interrupted by emergency stop");
+          completed = true;
+          break;
+        }
+        const auto snapshot = refresh_snapshot(false);
+        if (snapshot.sport_status == request->expected_status) {
+          send_ack(request->sequence, result,
+                   "mode reached stable ASTRALL sport state");
+          completed = true;
+          break;
+        }
+        std::this_thread::sleep_for(config.mode_poll_period);
+      }
+      if (!completed && !stop.load()) {
+        send_error(request->sequence, BridgeError::Timeout,
+                   "timed out waiting for ASTRALL sport state " +
+                       std::to_string(request->expected_status));
+      }
+    }
+  }
+
   void odometry_loop() {
     while (!stop.load() && udp.odometry != nullptr) {
       const auto datagram = udp.odometry->receive(std::chrono::milliseconds(50));
@@ -356,14 +490,14 @@ struct AgentRuntime::Impl {
           datagram->bytes, config.lidar_packing,
           config.odometry_position_scale, config.odometry_quaternion_scale);
       if (!parsed) {
-        last_error = "invalid UDP 6101 odometry datagram";
+        set_last_error("invalid UDP 6101 odometry datagram");
         continue;
       }
       OdometryPayload payload;
       payload.device_time = parsed->device_time;
       payload.position = parsed->position;
       payload.orientation = parsed->orientation;
-      enqueue_telemetry(
+      odometry_output.push(
           make_frame(MessageType::Odometry, encode_odometry(payload)));
     }
   }
@@ -374,7 +508,7 @@ struct AgentRuntime::Impl {
       if (datagram && !parse_point_cloud_packet(
                           datagram->bytes, config.lidar_packing,
                           config.point_coordinate_scale)) {
-        last_error = "invalid UDP 6100 point-cloud datagram";
+        set_last_error("invalid UDP 6100 point-cloud datagram");
       }
     }
   }
@@ -389,12 +523,11 @@ struct AgentRuntime::Impl {
       // TODO:参考手册第24页补充实现：实机确认UDP 6000 H.264分片及关键帧边界。
       CameraChunkPayload payload;
       payload.stream_id = 0;
-      payload.datagram_sequence = datagram_sequence++;
       payload.receive_time_ns = datagram->receive_time_ns;
-      payload.keyframe_hint = false;
+      payload.datagram_sequence = datagram_sequence++;
       payload.data = datagram->bytes;
-      enqueue_telemetry(make_frame(MessageType::CameraH264,
-                                   encode_camera_chunk(payload)));
+      camera_output.push(make_frame(MessageType::CameraH264,
+                                    encode_camera_chunk(payload)));
     }
   }
 
@@ -402,24 +535,30 @@ struct AgentRuntime::Impl {
     using namespace std::chrono_literals;
     while (true) {
       auto frame = control_output.try_pop();
-      if (!frame) {
-        frame = telemetry_output.wait_pop_for(10ms);
-      }
+      if (!frame) frame = state_output.try_pop();
+      if (!frame) frame = odometry_output.try_pop();
+      if (!frame) frame = sensor_output.try_pop();
+      if (!frame) frame = camera_output.wait_pop_for(10ms);
       if (frame) {
         try {
           if (!stream.write_all(ProtocolHandler::encode(*frame))) {
             stop.store(true);
+            stream.close();
             return;
           }
         } catch (const std::exception& error) {
-          last_error = error.what();
+          set_last_error(error.what());
           stop.store(true);
+          stream.close();
           return;
         }
         continue;
       }
-      if (control_output.closed() && telemetry_output.closed() &&
-          control_output.size() == 0U && telemetry_output.size() == 0U) {
+      if (control_output.closed() && state_output.closed() &&
+          odometry_output.closed() && sensor_output.closed() &&
+          camera_output.closed() && control_output.size() == 0U &&
+          state_output.size() == 0U && odometry_output.size() == 0U &&
+          sensor_output.size() == 0U && camera_output.size() == 0U) {
         return;
       }
     }
@@ -466,6 +605,7 @@ int AgentRuntime::run() {
   std::thread heartbeat([this] { impl_->heartbeat_loop(); });
   std::thread motion([this] { impl_->motion_loop(); });
   std::thread state([this] { impl_->state_loop(); });
+  std::thread mode([this] { impl_->mode_loop(); });
   std::thread odometry;
   std::thread lidar;
   std::thread camera;
@@ -490,19 +630,24 @@ int AgentRuntime::run() {
       }
     }
   } catch (const std::exception& error) {
-    impl_->last_error = error.what();
+    impl_->set_last_error(error.what());
   }
 
   impl_->stop.store(true);
   impl_->close_udp();
+  impl_->mode_requests.close();
   if (heartbeat.joinable()) heartbeat.join();
   if (motion.joinable()) motion.join();
   if (state.joinable()) state.join();
+  if (mode.joinable()) mode.join();
   if (odometry.joinable()) odometry.join();
   if (lidar.joinable()) lidar.join();
   if (camera.joinable()) camera.join();
   impl_->control_output.close();
-  impl_->telemetry_output.close();
+  impl_->state_output.close();
+  impl_->odometry_output.close();
+  impl_->sensor_output.close();
+  impl_->camera_output.close();
   if (writer.joinable()) writer.join();
   impl_->safe_shutdown();
   impl_->stream.close();
@@ -512,8 +657,12 @@ int AgentRuntime::run() {
 void AgentRuntime::request_stop() noexcept {
   impl_->stop.store(true);
   impl_->close_udp();
+  impl_->mode_requests.close();
   impl_->control_output.close();
-  impl_->telemetry_output.close();
+  impl_->state_output.close();
+  impl_->odometry_output.close();
+  impl_->sensor_output.close();
+  impl_->camera_output.close();
   impl_->stream.close();
 }
 

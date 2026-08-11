@@ -31,7 +31,7 @@ SSH 在这里是加密的长连接和进程通道，不把厂家 UDP 3600 暴露
 |---|---|---|
 | `/cmd_vel` | `geometry_msgs/msg/Twist` | 使用 `linear.x`、`linear.y`、`angular.z`，限制到 `[-1,1]` |
 | `/joint_commands` | `sensor_msgs/msg/JointState` | 保留接口；当前安全拒绝，不向机器人发送 |
-| `/robot_mode` | `std_msgs/msg/String` | `damping/stand/down/move/auto_charge/exit_charge/recovery` |
+| `/robot_mode` | `std_msgs/msg/String` | `damping/stand/down/move/auto_charge/exit_charge/recover`（兼容 `recovery`） |
 | `/emergency_stop` | `std_srvs/srv/SetBool` | `true` 锁存零速并请求阻尼，`false` 只解除软件锁存 |
 | `/imu/data` | `sensor_msgs/msg/Imu` | 默认 SensorDataQoS，四元数验证和归一化 |
 | `/joint_states` | `sensor_msgs/msg/JointState` | 保留 publisher；厂家接口到位前保持静默 |
@@ -44,6 +44,8 @@ SSH 在这里是加密的长连接和进程通道，不把厂家 UDP 3600 暴露
 - agent 以 10 Hz 调用 `AstrallHeartbeat`，以 50 Hz 调用 `AstrallMove`；PC `/cmd_vel` 默认 100 ms deadman。
 - 只有 SDK 已连接、持有控制权、运动状态为 `0xB104`、系统错误为零且急停未锁存时，非零速度才会下发。
 - PC 应用 PING/PONG 超过 500 ms 失联，agent 立即发送零速并请求 `0xA101` 阻尼。
+- SSH channel 建立后先允许 65 秒 SDK 初始化期；收到首个 PONG 后才切换到 500 ms 超时，避免 60 秒 `AstrallSdkInit` 尚未完成就误重连。
+- 急停帧优先于普通命令；速度突发只保留最新值。模式命令串行执行，达到手册规定的 `0xBxxx` 状态后才确认。
 - SSH 断线会把本机连接/SDK/控制权状态清零，取消等待中的服务请求并丢弃旧速度和旧模式；重连后不回放命令，必须重新选择模式并重新发送速度。
 - 遥控器抢权时 agent 不循环申请控制权。
 - `/emergency_stop false` 不恢复旧模式或旧速度；操作者必须重新 `stand`、`move` 并发送新命令。
@@ -67,6 +69,8 @@ hypertron_bridge:
 ```
 
 不建议把密码写进 YAML。环境变量 `HYPERTRON_SSH_PASSWORD` 会覆盖 YAML 密码，日志不会输出密码。生产环境应使用密钥并保持 `strict_host_key_checking: true`。
+
+桥接帧的头、消息号和 payload 精确定义见 [`HTBR_PROTOCOL.md`](HTBR_PROTOCOL.md)。
 
 ### known_hosts 初始化
 

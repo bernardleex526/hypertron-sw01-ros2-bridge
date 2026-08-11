@@ -179,9 +179,8 @@ struct RobotStatePayload {
 
 struct CameraChunkPayload {
   std::uint32_t stream_id{};
-  std::uint32_t datagram_sequence{};
   std::uint64_t receive_time_ns{};
-  bool keyframe_hint{};
+  std::uint32_t datagram_sequence{};
   std::vector<std::uint8_t> data;
   bool operator==(const CameraChunkPayload& o) const;
 };
@@ -223,8 +222,8 @@ struct LidarPoint {
 
 struct PointCloudPacket {
   std::uint64_t device_time{};
-  std::uint32_t frame_index{};
-  std::uint32_t data_index{};
+  std::uint32_t total_points{};
+  std::uint32_t packet_index{};
   std::vector<LidarPoint> points;
 };
 

@@ -13,6 +13,8 @@ hypertron_bridge:
       keepalive_interval_ms: 1000
       ping_interval_ms: 200
       application_timeout_ms: 500
+      # Must exceed astrall.initialization_timeout_ms.
+      agent_startup_timeout_ms: 65000
       reconnect_initial_delay_ms: 1000
       reconnect_max_delay_ms: 30000
 

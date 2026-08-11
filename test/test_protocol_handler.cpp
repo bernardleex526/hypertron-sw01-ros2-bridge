@@ -146,6 +146,11 @@ TEST(ProtocolHandler, RejectsUnknownVersionAndFlags) {
   EXPECT_THROW(decoder.feed(bad_flags), ProtocolError);
 }
 
+TEST(ProtocolHandler, EmptyNullFeedIsANoOp) {
+  ProtocolHandler decoder;
+  EXPECT_TRUE(decoder.feed(nullptr, 0).empty());
+}
+
 TEST(PayloadCodec, RoundTripsHandshakeControlAndResponses) {
   const HelloPayload hello{1, 1, 0x25U, 0x01020304U};
   EXPECT_EQ(decode_hello(encode_hello(hello)), hello);
@@ -190,8 +195,13 @@ TEST(PayloadCodec, RoundTripsTelemetryAndCamera) {
   state.wheel_speed = {1, 2, 3, 4};
   EXPECT_EQ(decode_robot_state(encode_robot_state(state)), state);
 
-  CameraChunkPayload camera{2, 10, 123456, true, {0, 0, 1, 0x67}};
-  EXPECT_EQ(decode_camera_chunk(encode_camera_chunk(camera)), camera);
+  CameraChunkPayload camera{2, 123456, 10, {0, 0, 1, 0x67}};
+  const auto camera_bytes = encode_camera_chunk(camera);
+  EXPECT_EQ(camera_bytes,
+            (std::vector<std::uint8_t>{
+                0, 0, 0, 2, 0, 0, 0, 0, 0, 1, 0xE2, 0x40,
+                0, 0, 0, 10, 0, 0, 1, 0x67}));
+  EXPECT_EQ(decode_camera_chunk(camera_bytes), camera);
 }
 
 TEST(PayloadCodec, RejectsMalformedAndNonFinitePayloads) {
@@ -202,6 +212,8 @@ TEST(PayloadCodec, RejectsMalformedAndNonFinitePayloads) {
   auto hello = encode_hello({1, 1, 0, 1});
   hello[2] = 1;
   EXPECT_THROW(decode_hello(hello), ProtocolError);
+  EXPECT_THROW(decode_hello(encode_hello({1, 1, 0x80000000U, 1})),
+               ProtocolError);
 }
 
 TEST(Sw01Udp, ParsesPackedOdometryAndNormalizesQuaternion) {

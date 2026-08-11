@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
-#include <filesystem>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -15,6 +14,7 @@
 namespace hypertron_ros2_bridge {
 namespace {
 
+#ifdef HYPERTRON_WITH_LIBSSH
 std::string expand_user_path(const std::string& path) {
   if (path.size() < 2U || path[0] != '~' || path[1] != '/') {
     return path;
@@ -22,6 +22,7 @@ std::string expand_user_path(const std::string& path) {
   const char* home = std::getenv("HOME");
   return home == nullptr ? path : std::string(home) + path.substr(1U);
 }
+#endif
 
 }  // namespace
 
@@ -65,16 +66,8 @@ ConnectResult LibsshBackend::connect(const SshConfig& config) {
 
   const auto known = ssh_session_is_known_server(impl_->session);
   if (known != SSH_KNOWN_HOSTS_OK) {
-    if (config.strict_host_key_checking ||
-        (known != SSH_KNOWN_HOSTS_UNKNOWN &&
-         known != SSH_KNOWN_HOSTS_NOT_FOUND)) {
-      disconnect();
-      return ConnectResult::PermanentFailure;
-    }
-    if (ssh_session_update_known_hosts(impl_->session) != SSH_OK) {
-      disconnect();
-      return ConnectResult::PermanentFailure;
-    }
+    disconnect();
+    return ConnectResult::PermanentFailure;
   }
 
   int auth = SSH_AUTH_DENIED;
@@ -136,6 +129,21 @@ std::optional<std::vector<std::uint8_t>> LibsshBackend::read_some(
     std::chrono::milliseconds timeout) {
 #ifdef HYPERTRON_WITH_LIBSSH
   if (impl_->channel == nullptr) return std::nullopt;
+
+  // Always drain agent stderr, including when stdout is idle. Otherwise a
+  // verbose diagnostic stream can fill the SSH window and stall binary data.
+  while (true) {
+    const auto stderr_available =
+        ssh_channel_poll_timeout(impl_->channel, 0, 1);
+    if (stderr_available <= 0) break;
+    std::vector<std::uint8_t> discarded(
+        std::min<std::size_t>(static_cast<std::size_t>(stderr_available),
+                              4096U));
+    if (ssh_channel_read_nonblocking(impl_->channel, discarded.data(),
+                                     discarded.size(), 1) <= 0) {
+      break;
+    }
+  }
   const auto available = ssh_channel_poll_timeout(
       impl_->channel, static_cast<int>(timeout.count()), 0);
   if (available == SSH_ERROR) return std::nullopt;
@@ -152,15 +160,6 @@ std::optional<std::vector<std::uint8_t>> LibsshBackend::read_some(
   if (count == SSH_ERROR || count == 0) return std::nullopt;
   bytes.resize(static_cast<std::size_t>(count));
 
-  // Drain agent stderr separately. It is diagnostic only and must never be
-  // mixed into the binary HTBR stdout stream.
-  const auto stderr_available = ssh_channel_poll_timeout(impl_->channel, 0, 1);
-  if (stderr_available > 0) {
-    std::vector<std::uint8_t> discarded(
-        std::min<std::size_t>(static_cast<std::size_t>(stderr_available), 4096U));
-    ssh_channel_read_nonblocking(impl_->channel, discarded.data(),
-                                 discarded.size(), 1);
-  }
   return bytes;
 #else
   (void)timeout;
@@ -170,7 +169,10 @@ std::optional<std::vector<std::uint8_t>> LibsshBackend::read_some(
 
 bool LibsshBackend::send_keepalive() {
 #ifdef HYPERTRON_WITH_LIBSSH
-  return impl_->session != nullptr && ssh_send_keepalive(impl_->session) == SSH_OK;
+  // Client-side SSH_MSG_IGNORE traffic keeps NAT/session state active on
+  // libssh 0.9.x; HTBR PING/PONG separately proves the agent is responsive.
+  return impl_->session != nullptr &&
+         ssh_send_ignore(impl_->session, "hypertron-keepalive") == SSH_OK;
 #else
   return false;
 #endif
@@ -209,7 +211,8 @@ SshTunnel::SshTunnel(SshConfig config, ISshBackend& backend,
     : config_(std::move(config)),
       backend_(backend),
       sleeper_(sleeper),
-      outgoing_(config_.queue_capacity, OverflowPolicy::RejectNew) {
+      priority_outgoing_(config_.queue_capacity, OverflowPolicy::RejectNew),
+      regular_outgoing_(config_.queue_capacity, OverflowPolicy::RejectNew) {
   if (const char* password = std::getenv("HYPERTRON_SSH_PASSWORD");
       password != nullptr && *password != '\0') {
     config_.password = password;
@@ -219,18 +222,35 @@ SshTunnel::SshTunnel(SshConfig config, ISshBackend& backend,
     throw std::invalid_argument(
         "SSH host, username and remote command are required");
   }
+  if (!config_.strict_host_key_checking) {
+    throw std::invalid_argument(
+        "strict SSH host-key checking cannot be disabled");
+  }
+  if (config_.connect_timeout.count() <= 0 ||
+      config_.keepalive_interval.count() <= 0 ||
+      config_.ping_interval.count() <= 0 ||
+      config_.application_timeout <= config_.ping_interval ||
+      config_.agent_startup_timeout < config_.application_timeout ||
+      config_.reconnect_initial_delay.count() <= 0 ||
+      config_.reconnect_max_delay < config_.reconnect_initial_delay ||
+      config_.max_payload == 0U) {
+    throw std::invalid_argument("SSH timeout, retry, or payload settings invalid");
+  }
 }
 
 SshTunnel::~SshTunnel() { stop(); }
 
 bool SshTunnel::start(FrameCallback on_frame, StateCallback on_state) {
-  if (worker_.joinable()) return false;
+  if (stop_invoked_.load() || started_.exchange(true) || worker_.joinable()) {
+    return false;
+  }
   {
     std::lock_guard<std::mutex> lock(callback_mutex_);
     on_frame_ = std::move(on_frame);
     on_state_ = std::move(on_state);
   }
   stop_.store(false);
+  stop_invoked_.store(false);
   worker_ = std::thread([this] { run(); });
   return true;
 }
@@ -239,14 +259,26 @@ bool SshTunnel::send(Frame frame) {
   if (state_.load() != ConnectionState::Connected || stop_.load()) {
     return false;
   }
-  return outgoing_.push(std::move(frame));
+  if (frame.type == MessageType::CmdEstop) {
+    return priority_outgoing_.push(std::move(frame));
+  }
+  if (frame.type == MessageType::CmdVelocity) {
+    std::lock_guard<std::mutex> lock(velocity_mutex_);
+    latest_velocity_ = std::move(frame);
+    return true;
+  }
+  return regular_outgoing_.push(std::move(frame));
 }
 
 void SshTunnel::stop() {
+  if (stop_invoked_.exchange(true)) return;
   stop_.store(true);
-  outgoing_.close();
-  backend_.disconnect();
+  priority_outgoing_.close();
+  regular_outgoing_.close();
   if (worker_.joinable()) worker_.join();
+  // The backend is worker-owned while the worker exists. Disconnect only
+  // after join to avoid freeing a libssh session during read/write.
+  backend_.disconnect();
   set_state(ConnectionState::Stopped, "SSH tunnel stopped");
 }
 
@@ -273,6 +305,10 @@ bool SshTunnel::run_until_connected() {
 
 ConnectionState SshTunnel::state() const noexcept { return state_.load(); }
 
+std::uint32_t SshTunnel::protocol_drops() const noexcept {
+  return protocol_drops_.load();
+}
+
 void SshTunnel::run() {
   auto reconnect_delay = config_.reconnect_initial_delay;
   while (!stop_.load()) {
@@ -285,12 +321,28 @@ void SshTunnel::run() {
     auto last_pong = std::chrono::steady_clock::now();
     auto last_ping = last_pong;
     auto last_keepalive = last_pong;
+    bool received_pong = false;
     bool channel_ok = true;
     while (!stop_.load() && channel_ok) {
-      while (auto frame = outgoing_.try_pop()) {
+      while (auto frame = priority_outgoing_.try_pop()) {
         if (!backend_.write_all(ProtocolHandler::encode(*frame))) {
           channel_ok = false;
           break;
+        }
+      }
+      std::optional<Frame> velocity;
+      {
+        std::lock_guard<std::mutex> lock(velocity_mutex_);
+        velocity.swap(latest_velocity_);
+      }
+      if (channel_ok && velocity &&
+          !backend_.write_all(ProtocolHandler::encode(*velocity))) {
+        channel_ok = false;
+      }
+      if (channel_ok) {
+        if (auto frame = regular_outgoing_.try_pop(); frame &&
+            !backend_.write_all(ProtocolHandler::encode(*frame))) {
+          channel_ok = false;
         }
       }
       const auto now = std::chrono::steady_clock::now();
@@ -315,20 +367,34 @@ void SshTunnel::run() {
         } else if (!bytes->empty()) {
           try {
             for (auto& frame : decoder.feed(*bytes)) {
-              if (frame.type == MessageType::Pong) last_pong = now;
+              if (frame.type == MessageType::Pong) {
+                last_pong = now;
+                received_pong = true;
+              }
               FrameCallback callback;
               {
                 std::lock_guard<std::mutex> lock(callback_mutex_);
                 callback = on_frame_;
               }
-              if (callback) callback(std::move(frame));
+              if (callback) {
+                try {
+                  callback(std::move(frame));
+                } catch (...) {
+                  channel_ok = false;
+                  break;
+                }
+              }
             }
           } catch (const ProtocolError&) {
+            protocol_drops_.fetch_add(1);
             channel_ok = false;
           }
         }
       }
-      if (now - last_pong > config_.application_timeout) channel_ok = false;
+      const auto liveness_timeout =
+          received_pong ? config_.application_timeout
+                        : config_.agent_startup_timeout;
+      if (now - last_pong > liveness_timeout) channel_ok = false;
     }
     state_.store(ConnectionState::Disconnected);
     backend_.disconnect();
@@ -351,12 +417,22 @@ void SshTunnel::set_state(ConnectionState state, const std::string& detail) {
     std::lock_guard<std::mutex> lock(callback_mutex_);
     callback = on_state_;
   }
-  if (callback) callback(state, detail);
+  if (callback) {
+    try {
+      callback(state, detail);
+    } catch (...) {
+      // User callbacks must not terminate the transport worker.
+    }
+  }
 }
 
 void SshTunnel::drop_pending_commands() {
-  while (outgoing_.try_pop()) {
+  while (priority_outgoing_.try_pop()) {
   }
+  while (regular_outgoing_.try_pop()) {
+  }
+  std::lock_guard<std::mutex> lock(velocity_mutex_);
+  latest_velocity_.reset();
 }
 
 }  // namespace hypertron_ros2_bridge

@@ -29,6 +29,7 @@ struct SshConfig {
   std::chrono::milliseconds keepalive_interval{1000};
   std::chrono::milliseconds ping_interval{200};
   std::chrono::milliseconds application_timeout{500};
+  std::chrono::milliseconds agent_startup_timeout{65000};
   std::chrono::milliseconds reconnect_initial_delay{1000};
   std::chrono::milliseconds reconnect_max_delay{30000};
   std::size_t queue_capacity{64};
@@ -98,6 +99,7 @@ class SshTunnel {
   void stop();
   bool run_until_connected();
   ConnectionState state() const noexcept;
+  std::uint32_t protocol_drops() const noexcept;
 
  private:
   void run();
@@ -107,10 +109,16 @@ class SshTunnel {
   SshConfig config_;
   ISshBackend& backend_;
   ISleeper& sleeper_;
-  ThreadSafeQueue<Frame> outgoing_;
+  ThreadSafeQueue<Frame> priority_outgoing_;
+  ThreadSafeQueue<Frame> regular_outgoing_;
+  std::mutex velocity_mutex_;
+  std::optional<Frame> latest_velocity_;
   std::atomic_bool stop_{false};
+  std::atomic_bool stop_invoked_{false};
+  std::atomic_bool started_{false};
   std::atomic<ConnectionState> state_{ConnectionState::Stopped};
   std::atomic<std::uint32_t> ping_sequence_{1};
+  std::atomic<std::uint32_t> protocol_drops_{0};
   mutable std::mutex callback_mutex_;
   FrameCallback on_frame_;
   StateCallback on_state_;

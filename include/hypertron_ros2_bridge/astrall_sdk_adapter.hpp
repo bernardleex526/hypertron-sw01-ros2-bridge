@@ -47,6 +47,8 @@ class IAstrallSdk {
   virtual void deinit() noexcept = 0;
   virtual std::uint16_t heartbeat(std::uint32_t timeout_ms) = 0;
   virtual std::uint16_t acquire_sdk_control(std::uint32_t timeout_ms) = 0;
+  virtual std::uint16_t configure_udp_streams(bool camera, bool lidar,
+                                              std::uint32_t timeout_ms) = 0;
   virtual std::uint16_t move(float vx, float vy, float vyaw,
                              std::uint32_t timeout_ms) = 0;
   virtual std::uint16_t set_mode(std::uint16_t mode,
@@ -69,6 +71,8 @@ class AstrallSdkAdapter final : public IAstrallSdk {
   void deinit() noexcept override;
   std::uint16_t heartbeat(std::uint32_t timeout_ms) override;
   std::uint16_t acquire_sdk_control(std::uint32_t timeout_ms) override;
+  std::uint16_t configure_udp_streams(bool camera, bool lidar,
+                                      std::uint32_t timeout_ms) override;
   std::uint16_t move(float vx, float vy, float vyaw,
                      std::uint32_t timeout_ms) override;
   std::uint16_t set_mode(std::uint16_t mode,
@@ -118,6 +122,8 @@ struct AgentConfig {
   std::chrono::milliseconds state_period{500};
   std::chrono::milliseconds application_timeout{500};
   std::chrono::milliseconds command_deadman{100};
+  std::chrono::milliseconds mode_timeout{10000};
+  std::chrono::milliseconds mode_poll_period{50};
   std::size_t output_queue_capacity{256};
   std::uint32_t max_payload{kDefaultMaxPayload};
   PackingMode lidar_packing{PackingMode::Auto};

@@ -49,6 +49,8 @@ uint16_t AstrallSendMessage(char* data, uint16_t len);
 
 `AstrallSdkInit` 通过 `AstrallConfig::heartbeatCb` 与 `sdkStatusCb` 上报心跳和 `link/ctrlAuthority`。初始化成功并不代表已取得控制权；`AstrallAuthControl(ASTRALL_AUTH_SDK)` 才申请 SDK 控制权。遥控器抢权后，agent 不循环抢回。
 
+其余关键结构为：`AstrallDeviceInfo` 包含版本字符串、序列号和 `model u32`；`AstrallSdkStatus` 是 `link/ctrlAuthority/reserve` 位域；`AstrallJoystickData` 包含 64 位时间戳、六轴 `int16 rocker[6]`，以及 L1/L2/L3、R1/R2/R3、SL/SR、H 和两位 SW 按键位。当前 ROS 桥不发布设备信息或遥控器输入，但这些定义已保留在厂家适配边界，后续扩展时不得按网络结构直接发送位域。
+
 ## 模式、运动与安全时序
 
 | ROS 字符串 | 厂家命令 | 对应主要状态 |
@@ -59,7 +61,7 @@ uint16_t AstrallSendMessage(char* data, uint16_t len);
 | `move` | `0xA104` | `0xB104` |
 | `auto_charge` | `0xA105` | `0xB107` 起始 |
 | `exit_charge` | `0xA106` | `0xB10B` 过程 |
-| `recovery` | `0xA1FF` | `0xB1FF` |
+| `recover`（兼容 `recovery`） | `0xA1FF` | `0xB1FF` |
 
 - `AstrallMove(vx, vy, vyaw)` 三个分量均为 `[-1, 1]`，停止必须明确发送 `(0,0,0)`。
 - 机器人在运动中约 50 ms 未收到运动指令会自动停止，因此 agent 以 50 Hz 刷新。

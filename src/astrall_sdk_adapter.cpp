@@ -163,6 +163,31 @@ std::uint16_t AstrallSdkAdapter::acquire_sdk_control(
 #endif
 }
 
+std::uint16_t AstrallSdkAdapter::configure_udp_streams(
+    bool camera, bool lidar, std::uint32_t timeout_ms) {
+#ifdef HYPERTRON_WITH_ASTRALL_SDK
+  const auto discard_callback = [](void*, std::uint16_t) {};
+  if (camera) {
+    const auto result = AstrallSubscriptionData(
+        ASTRALL_SUB_TOPIC_ID_CAMERA_RGB, ASTRALL_SUB_FREQ_1HZ,
+        discard_callback, timeout_ms);
+    if (result != ASTRALL_RES_SUCCESSED) return result;
+  }
+  if (lidar) {
+    const auto result = AstrallSubscriptionData(
+        ASTRALL_SUB_TOPIC_ID_LIDAR, ASTRALL_SUB_FREQ_1HZ,
+        discard_callback, timeout_ms);
+    if (result != ASTRALL_RES_SUCCESSED) return result;
+  }
+  return ASTRALL_RES_SUCCESSED;
+#else
+  (void)camera;
+  (void)lidar;
+  (void)timeout_ms;
+  return 0x8011U;
+#endif
+}
+
 std::uint16_t AstrallSdkAdapter::move(float vx, float vy, float vyaw,
                                       std::uint32_t timeout_ms) {
 #ifdef HYPERTRON_WITH_ASTRALL_SDK

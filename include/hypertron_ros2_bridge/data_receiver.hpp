@@ -39,6 +39,7 @@ struct DataReceiverConfig {
   std::string robot_state_topic{"/robot_state"};
   std::string camera_topic{"/camera/image_raw"};
   TimestampSource timestamp_source{TimestampSource::Receive};
+  TimestampSource odometry_timestamp_source{TimestampSource::Receive};
   QuaternionOrder quaternion_order{QuaternionOrder::Xyzw};
   std::array<double, 3> orientation_covariance_diagonal{0.02, 0.02, 0.05};
   std::array<double, 3> angular_velocity_covariance_diagonal{0.01, 0.01,

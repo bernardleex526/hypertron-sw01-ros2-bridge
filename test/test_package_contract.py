@@ -8,8 +8,14 @@ def test_required_artifacts_and_public_contract_exist() -> None:
     required = [
         "CMakeLists.txt",
         "package.xml",
+        "HTBR_PROTOCOL.md",
+        "REVIEW.md",
         "msg/RobotState.msg",
         "config/bridge_config.yaml",
+        "include/ssh_tunnel.hpp",
+        "include/protocol_handler.hpp",
+        "include/robot_controller.hpp",
+        "include/data_receiver.hpp",
         "src/main.cpp",
     ]
     assert all((ROOT / path).is_file() for path in required)
@@ -44,6 +50,11 @@ def test_ros_bridge_source_declares_required_graph_interfaces() -> None:
         "reject_joint_command",
     ):
         assert token in source
+
+    receiver = (ROOT / "src/data_receiver.cpp").read_text(encoding="utf-8")
+    assert "camera_queue" in receiver
+    assert "camera_worker" in receiver
+    assert "pc_receive_time_ns" in receiver
 
 
 def test_operator_documentation_covers_deployment_safety_and_sources() -> None:

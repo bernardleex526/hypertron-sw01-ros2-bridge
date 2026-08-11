@@ -10,7 +10,8 @@ namespace hypertron_ros2_bridge {
 
 class HypertronBridgeNode final : public rclcpp::Node {
  public:
-  explicit HypertronBridgeNode(const rclcpp::NodeOptions& options = {});
+  explicit HypertronBridgeNode(
+      const rclcpp::NodeOptions& options = rclcpp::NodeOptions());
   ~HypertronBridgeNode() override;
 
  private:

@@ -90,7 +90,7 @@ ModeDecision RobotController::request_mode(std::string_view name) const {
       {"damping", 0xA101U},     {"stand", 0xA102U},
       {"down", 0xA103U},        {"move", 0xA104U},
       {"auto_charge", 0xA105U}, {"exit_charge", 0xA106U},
-      {"recovery", 0xA1FFU},
+      {"recover", 0xA1FFU},     {"recovery", 0xA1FFU},
   };
   const auto normalized = normalized_mode(name);
   const auto mode = kModes.find(normalized);

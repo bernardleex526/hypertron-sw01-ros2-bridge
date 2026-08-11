@@ -15,6 +15,7 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -25,9 +26,9 @@
 namespace hypertron_ros2_bridge {
 namespace {
 
-std::atomic_bool g_signal_received{false};
+volatile std::sig_atomic_t g_signal_received = 0;
 
-extern "C" void handle_signal(int) { g_signal_received.store(true); }
+extern "C" void handle_signal(int) { g_signal_received = 1; }
 
 class StdioByteStream final : public IByteStream {
  public:
@@ -173,6 +174,24 @@ std::chrono::milliseconds period_from_hz(const std::string& value) {
       static_cast<std::int64_t>(std::llround(1000.0 / hz)));
 }
 
+std::uint16_t parse_port(const std::string& value) {
+  const auto port = std::stoul(value);
+  if (port == 0U || port > 65535U) {
+    throw std::runtime_error("UDP port must be in [1, 65535]");
+  }
+  return static_cast<std::uint16_t>(port);
+}
+
+std::uint32_t parse_u32(const std::string& value, const char* field,
+                        std::uint32_t maximum =
+                            std::numeric_limits<std::uint32_t>::max()) {
+  const auto parsed = std::stoull(value);
+  if (parsed == 0U || parsed > maximum) {
+    throw std::runtime_error(std::string(field) + " is outside its valid range");
+  }
+  return static_cast<std::uint32_t>(parsed);
+}
+
 AgentFileSettings load_config(const std::string& path) {
   AgentFileSettings settings;
   std::ifstream input(path);
@@ -199,9 +218,10 @@ AgentFileSettings load_config(const std::string& path) {
       settings.agent.application_timeout =
           std::chrono::milliseconds(std::stoll(value));
     } else if (section == "astrall" && key == "sdk_timeout_ms") {
-      settings.agent.sdk_call_timeout_ms = std::stoul(value);
+      settings.agent.sdk_call_timeout_ms = parse_u32(value, "sdk_timeout_ms");
     } else if (section == "astrall" && key == "initialization_timeout_ms") {
-      settings.agent.init_timeout_ms = std::stoul(value);
+      settings.agent.init_timeout_ms =
+          parse_u32(value, "initialization_timeout_ms");
     } else if (section == "astrall" && key == "heartbeat_hz") {
       settings.agent.heartbeat_period = period_from_hz(value);
     } else if (section == "astrall" && key == "motion_refresh_hz") {
@@ -213,18 +233,23 @@ AgentFileSettings load_config(const std::string& path) {
     } else if (section == "safety" && key == "command_deadman_ms") {
       settings.agent.command_deadman =
           std::chrono::milliseconds(std::stoll(value));
+    } else if (section == "safety" && key == "mode_timeout_ms") {
+      settings.agent.mode_timeout =
+          std::chrono::milliseconds(std::stoll(value));
     } else if (section == "safety" && key == "telemetry_queue_capacity") {
-      settings.agent.output_queue_capacity = std::stoul(value);
+      settings.agent.output_queue_capacity =
+          parse_u32(value, "telemetry_queue_capacity", 1000000U);
     } else if (section == "safety" && key == "max_payload_bytes") {
-      settings.agent.max_payload = std::stoul(value);
+      settings.agent.max_payload =
+          parse_u32(value, "max_payload_bytes", 64U * 1024U * 1024U);
     } else if (section == "odometry" && key == "enabled") {
       settings.odometry_enabled = parse_bool(value);
     } else if (section == "odometry" && key == "bind_address") {
       settings.lidar_bind = value;
     } else if (section == "odometry" && key == "point_cloud_port") {
-      settings.point_cloud_port = static_cast<std::uint16_t>(std::stoul(value));
+      settings.point_cloud_port = parse_port(value);
     } else if (section == "odometry" && key == "odometry_port") {
-      settings.odometry_port = static_cast<std::uint16_t>(std::stoul(value));
+      settings.odometry_port = parse_port(value);
     } else if (section == "odometry" && key == "packing") {
       settings.agent.lidar_packing =
           value == "packed"     ? PackingMode::Packed
@@ -243,7 +268,7 @@ AgentFileSettings load_config(const std::string& path) {
     } else if (section == "camera" && key == "bind_address") {
       settings.camera_bind = value;
     } else if (section == "camera" && key == "port") {
-      settings.camera_port = static_cast<std::uint16_t>(std::stoul(value));
+      settings.camera_port = parse_port(value);
     }
   }
   return settings;
@@ -256,6 +281,10 @@ void install_signal_handlers() {
   action.sa_flags = 0;
   sigaction(SIGINT, &action, nullptr);
   sigaction(SIGTERM, &action, nullptr);
+  struct sigaction ignore_pipe {};
+  ignore_pipe.sa_handler = SIG_IGN;
+  sigemptyset(&ignore_pipe.sa_mask);
+  sigaction(SIGPIPE, &ignore_pipe, nullptr);
 }
 
 }  // namespace

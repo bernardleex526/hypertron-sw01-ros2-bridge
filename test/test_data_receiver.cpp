@@ -69,9 +69,20 @@ TEST(DataReceiver, MapsOdometryFramesAndNormalizesQuaternion) {
   EXPECT_DOUBLE_EQ(sample.orientation[3], 1.0);
 }
 
+TEST(DataReceiver, OdometryTimestampSourceIsIndependentFromImu) {
+  OdometryPayload payload;
+  payload.device_time = 20;
+  payload.orientation = {0, 0, 0, 1};
+  auto cfg = config();
+  cfg.timestamp_source = TimestampSource::DeviceNanoseconds;
+  cfg.odometry_timestamp_source = TimestampSource::DeviceMilliseconds;
+  const auto sample = to_odometry_sample(payload, 300, cfg);
+  EXPECT_EQ(sample.timestamp_ns, 20000000U);
+}
+
 TEST(DataReceiver, CameraDisabledIsNonFatalAndCountsDrop) {
   CameraIngestState state(false);
-  EXPECT_FALSE(state.accept({1, 1, 1, false, {0, 0, 1}}));
+  EXPECT_FALSE(state.accept({1, 1, 1, {0, 0, 1}}));
   EXPECT_EQ(state.disabled_drops(), 1U);
 }
 

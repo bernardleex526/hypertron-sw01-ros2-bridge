@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 #include <builtin_interfaces/msg/time.hpp>
@@ -17,6 +18,7 @@
 #include <sensor_msgs/msg/joint_state.hpp>
 
 #include "hypertron_ros2_bridge/msg/robot_state.hpp"
+#include "hypertron_ros2_bridge/thread_safe_queue.hpp"
 
 #ifdef HYPERTRON_ENABLE_CAMERA
 extern "C" {
@@ -47,11 +49,22 @@ std::array<double, 36> unknown_pose_covariance() {
 
 }  // namespace
 
+#ifdef HYPERTRON_ENABLE_CAMERA
+struct CameraWork {
+  CameraChunkPayload payload;
+  std::uint64_t pc_receive_time_ns{};
+};
+#endif
+
 struct DataReceiver::Impl {
   Impl(rclcpp::Node& node_value, DataReceiverConfig config_value)
       : node(node_value),
         config(std::move(config_value)),
-        camera_state(config.camera_enabled) {
+        camera_state(config.camera_enabled)
+#ifdef HYPERTRON_ENABLE_CAMERA
+        , camera_queue(2U, OverflowPolicy::DropOldest)
+#endif
+  {
     const auto sensor_qos = rclcpp::SensorDataQoS();
     imu = node.create_publisher<sensor_msgs::msg::Imu>(config.imu_topic,
                                                        sensor_qos);
@@ -65,12 +78,17 @@ struct DataReceiver::Impl {
     image = node.create_publisher<sensor_msgs::msg::Image>(config.camera_topic,
                                                            sensor_qos);
 #ifdef HYPERTRON_ENABLE_CAMERA
-    if (config.camera_enabled) initialize_decoder();
+    if (config.camera_enabled) {
+      initialize_decoder();
+      camera_worker = std::thread([this] { camera_loop(); });
+    }
 #endif
   }
 
   ~Impl() {
 #ifdef HYPERTRON_ENABLE_CAMERA
+    camera_queue.close();
+    if (camera_worker.joinable()) camera_worker.join();
     if (parser != nullptr) av_parser_close(parser);
     if (codec_context != nullptr) avcodec_free_context(&codec_context);
     if (packet != nullptr) av_packet_free(&packet);
@@ -82,6 +100,10 @@ struct DataReceiver::Impl {
   rclcpp::Node& node;
   DataReceiverConfig config;
   CameraIngestState camera_state;
+#ifdef HYPERTRON_ENABLE_CAMERA
+  ThreadSafeQueue<CameraWork> camera_queue;
+  std::thread camera_worker;
+#endif
   std::mutex state_mutex;
   ReceiverConnectionState connection;
   std::atomic<std::uint32_t> camera_error_count{0};
@@ -140,7 +162,8 @@ struct DataReceiver::Impl {
     image->publish(std::move(message));
   }
 
-  void decode_camera(const CameraChunkPayload& payload) {
+  void decode_camera(const CameraChunkPayload& payload,
+                     std::uint64_t pc_receive_time_ns) {
     const std::uint8_t* input = payload.data.data();
     int remaining = static_cast<int>(payload.data.size());
     while (remaining > 0) {
@@ -165,8 +188,28 @@ struct DataReceiver::Impl {
         const auto result = avcodec_receive_frame(codec_context, frame);
         if (result == AVERROR(EAGAIN) || result == AVERROR_EOF) break;
         if (result < 0) throw MappingError("avcodec_receive_frame failed");
-        publish_decoded_frame(payload.receive_time_ns);
+        // Agent timestamps are steady-clock values with no ROS epoch. Stamp
+        // decoded images at PC receipt so all ROS consumers see a valid clock.
+        publish_decoded_frame(pc_receive_time_ns);
         av_frame_unref(frame);
+      }
+    }
+  }
+
+  void camera_loop() {
+    using namespace std::chrono_literals;
+    while (true) {
+      auto work = camera_queue.wait_pop_for(50ms);
+      if (!work) {
+        if (camera_queue.closed()) return;
+        continue;
+      }
+      try {
+        decode_camera(work->payload, work->pc_receive_time_ns);
+      } catch (const std::exception& error) {
+        camera_error_count.fetch_add(1);
+        std::lock_guard<std::mutex> lock(state_mutex);
+        connection.last_error = error.what();
       }
     }
   }
@@ -259,7 +302,7 @@ void DataReceiver::handle(const Frame& frame, std::uint64_t receive_time_ns) {
       const auto payload = decode_camera_chunk(frame.payload);
       if (!impl_->camera_state.accept(payload)) return;
 #ifdef HYPERTRON_ENABLE_CAMERA
-      impl_->decode_camera(payload);
+      impl_->camera_queue.push({std::move(payload), receive_time_ns});
 #else
       impl_->camera_error_count.fetch_add(1);
 #endif
@@ -269,6 +312,7 @@ void DataReceiver::handle(const Frame& frame, std::uint64_t receive_time_ns) {
       impl_->camera_error_count.fetch_add(1);
     }
     std::lock_guard<std::mutex> lock(impl_->state_mutex);
+    ++impl_->connection.protocol_rx_drops;
     impl_->connection.last_error = error.what();
   }
 }
