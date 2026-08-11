@@ -89,12 +89,27 @@ if(BUILD_ROS2_BRIDGE)
     "msg/RobotState.msg"
     DEPENDENCIES std_msgs)
 
-  add_executable(hypertron_bridge_node src/main.cpp)
+  add_executable(hypertron_bridge_node
+    src/bridge_node.cpp
+    src/data_receiver.cpp
+    src/main.cpp)
+  target_compile_definitions(hypertron_bridge_node PRIVATE
+    HYPERTRON_WITH_ROS2=1)
   ament_target_dependencies(hypertron_bridge_node
     geometry_msgs nav_msgs rclcpp sensor_msgs std_msgs std_srvs)
   rosidl_get_typesupport_target(cpp_typesupport_target
     ${PROJECT_NAME} "rosidl_typesupport_cpp")
-  target_link_libraries(hypertron_bridge_node "${cpp_typesupport_target}")
+  target_link_libraries(hypertron_bridge_node
+    hypertron_protocol hypertron_ssh Threads::Threads
+    "${cpp_typesupport_target}")
+
+  if(ENABLE_CAMERA)
+    pkg_check_modules(FFMPEG REQUIRED IMPORTED_TARGET
+      libavcodec libavutil libswscale)
+    target_compile_definitions(hypertron_bridge_node PRIVATE
+      HYPERTRON_ENABLE_CAMERA=1)
+    target_link_libraries(hypertron_bridge_node PkgConfig::FFMPEG)
+  endif()
 
   install(TARGETS hypertron_bridge_node
     DESTINATION lib/${PROJECT_NAME})
