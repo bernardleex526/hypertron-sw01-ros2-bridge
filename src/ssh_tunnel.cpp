@@ -12,9 +12,22 @@
 #endif
 
 namespace hypertron_ros2_bridge {
+namespace detail {
+
+LibsshReadDisposition classify_libssh_read(int count) noexcept {
+  if (count > 0) return LibsshReadDisposition::Data;
+  if (count == -2) return LibsshReadDisposition::Again;
+  if (count == 0 || count == -127) return LibsshReadDisposition::Eof;
+  return LibsshReadDisposition::Error;
+}
+
+}  // namespace detail
 namespace {
 
 #ifdef HYPERTRON_WITH_LIBSSH
+static_assert(SSH_AGAIN == -2, "libssh SSH_AGAIN value changed");
+static_assert(SSH_EOF == -127, "libssh SSH_EOF value changed");
+
 std::string expand_user_path(const std::string& path) {
   if (path.size() < 2U || path[0] != '~' || path[1] != '/') {
     return path;
@@ -115,7 +128,7 @@ bool LibsshBackend::write_all(const std::vector<std::uint8_t>& bytes) {
   while (offset < bytes.size()) {
     const auto count = ssh_channel_write(impl_->channel, bytes.data() + offset,
                                          bytes.size() - offset);
-    if (count == SSH_ERROR || count == 0) return false;
+    if (count < 0 || count == 0) return false;
     offset += static_cast<std::size_t>(count);
   }
   return true;
@@ -146,7 +159,7 @@ std::optional<std::vector<std::uint8_t>> LibsshBackend::read_some(
   }
   const auto available = ssh_channel_poll_timeout(
       impl_->channel, static_cast<int>(timeout.count()), 0);
-  if (available == SSH_ERROR) return std::nullopt;
+  if (available < 0) return std::nullopt;
   if (available == 0) {
     return ssh_channel_is_eof(impl_->channel) != 0
                ? std::optional<std::vector<std::uint8_t>>{}
@@ -157,7 +170,15 @@ std::optional<std::vector<std::uint8_t>> LibsshBackend::read_some(
       std::min<std::size_t>(static_cast<std::size_t>(available), 64U * 1024U));
   const auto count = ssh_channel_read_nonblocking(
       impl_->channel, bytes.data(), bytes.size(), 0);
-  if (count == SSH_ERROR || count == 0) return std::nullopt;
+  switch (detail::classify_libssh_read(count)) {
+    case detail::LibsshReadDisposition::Data:
+      break;
+    case detail::LibsshReadDisposition::Again:
+      return std::vector<std::uint8_t>{};
+    case detail::LibsshReadDisposition::Eof:
+    case detail::LibsshReadDisposition::Error:
+      return std::nullopt;
+  }
   bytes.resize(static_cast<std::size_t>(count));
 
   return bytes;
@@ -251,7 +272,23 @@ bool SshTunnel::start(FrameCallback on_frame, StateCallback on_state) {
   }
   stop_.store(false);
   stop_invoked_.store(false);
-  worker_ = std::thread([this] { run(); });
+  worker_ = std::thread([this] {
+    try {
+      run();
+    } catch (...) {
+      backend_.disconnect();
+      try {
+        drop_pending_commands();
+      } catch (...) {
+      }
+      state_.store(ConnectionState::Disconnected);
+      try {
+        set_state(ConnectionState::Disconnected,
+                  "SSH worker stopped after an unhandled exception");
+      } catch (...) {
+      }
+    }
+  });
   return true;
 }
 
@@ -312,6 +349,7 @@ std::uint32_t SshTunnel::protocol_drops() const noexcept {
 void SshTunnel::run() {
   auto reconnect_delay = config_.reconnect_initial_delay;
   while (!stop_.load()) {
+    try {
     if (!run_until_connected()) {
       if (state_.load() == ConnectionState::Failed) return;
       continue;
@@ -323,6 +361,7 @@ void SshTunnel::run() {
     auto last_keepalive = last_pong;
     bool received_pong = false;
     bool channel_ok = true;
+    std::string channel_failure_detail;
     while (!stop_.load() && channel_ok) {
       while (auto frame = priority_outgoing_.try_pop()) {
         if (!backend_.write_all(ProtocolHandler::encode(*frame))) {
@@ -379,7 +418,17 @@ void SshTunnel::run() {
               if (callback) {
                 try {
                   callback(std::move(frame));
+                } catch (const std::exception& error) {
+                  protocol_drops_.fetch_add(1);
+                  channel_failure_detail =
+                      std::string("frame callback rejected payload: ") +
+                      error.what();
+                  channel_ok = false;
+                  break;
                 } catch (...) {
+                  protocol_drops_.fetch_add(1);
+                  channel_failure_detail =
+                      "frame callback rejected payload: unknown failure";
                   channel_ok = false;
                   break;
                 }
@@ -387,6 +436,7 @@ void SshTunnel::run() {
             }
           } catch (const ProtocolError&) {
             protocol_drops_.fetch_add(1);
+            channel_failure_detail = "HTBR frame decoding failed";
             channel_ok = false;
           }
         }
@@ -400,13 +450,32 @@ void SshTunnel::run() {
     backend_.disconnect();
     drop_pending_commands();
     set_state(ConnectionState::Disconnected,
-              "SSH agent channel disconnected; commands cleared");
+              channel_failure_detail.empty()
+                  ? "SSH agent channel disconnected; commands cleared"
+                  : channel_failure_detail);
     if (!stop_.load() &&
         !sleeper_.sleep_for(reconnect_delay, stop_)) {
       break;
     }
     reconnect_delay =
         std::min(reconnect_delay * 2, config_.reconnect_max_delay);
+    } catch (const std::exception& error) {
+      backend_.disconnect();
+      drop_pending_commands();
+      set_state(ConnectionState::Disconnected,
+                std::string("SSH worker exception: ") + error.what());
+      if (!stop_.load()) {
+        if (!sleeper_.sleep_for(reconnect_delay, stop_)) break;
+        reconnect_delay =
+            std::min(reconnect_delay * 2, config_.reconnect_max_delay);
+      }
+    } catch (...) {
+      backend_.disconnect();
+      drop_pending_commands();
+      set_state(ConnectionState::Disconnected,
+                "SSH worker exception: unknown failure");
+      stop_.store(true);
+    }
   }
 }
 

@@ -1,4 +1,5 @@
 from pathlib import Path
+import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -109,3 +110,69 @@ def test_readme_contains_complete_public_commissioning_sop() -> None:
         "不能声称已通过真实 SW01 实机验证",
     )
     assert all(token in readme for token in required)
+
+
+def test_public_sample_only_exposes_effective_configuration() -> None:
+    config = (ROOT / "config/bridge_config.yaml").read_text(encoding="utf-8")
+    for removed_noop in (
+        "imu_frequency:",
+        "sport_frequency:",
+        "auto_prepare_motion:",
+        "output_encoding:",
+        "\n      queue_capacity: 2",
+    ):
+        assert removed_noop not in config
+
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for fixed_behavior in (
+        "IMU subscription: fixed at 125 Hz",
+        "sport subscription: fixed at 50 Hz",
+        "automatic motion preparation: disabled",
+        "camera decode queue: fixed capacity 2",
+        "camera output encoding: fixed BGR8",
+    ):
+        assert fixed_behavior in readme
+
+
+def test_readme_commands_assume_the_repository_is_the_package_root() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for required in (
+        "<HYPERTRON_WS>/src/hypertron_ros2_bridge",
+        "git clone <REPOSITORY_URL>",
+        "cmake -S .",
+        "python -m pytest test/test_package_contract.py -q",
+        "Press Ctrl+C in the velocity publisher terminal",
+        "libavcodec-dev libavutil-dev libswscale-dev",
+        "PC -> agent",
+        "agent -> PC",
+    ):
+        assert required in readme
+
+
+def test_apache_license_is_complete_and_installed(tmp_path: Path) -> None:
+    license_path = ROOT / "LICENSE"
+    text = license_path.read_text(encoding="utf-8")
+    assert text.startswith("Apache License\n                           Version 2.0")
+    assert "END OF TERMS AND CONDITIONS" in text
+
+    build = tmp_path / "build"
+    install = tmp_path / "install"
+    subprocess.run(
+        [
+            "cmake",
+            "-S",
+            str(ROOT),
+            "-B",
+            str(build),
+            "-DBUILD_ROS2_BRIDGE=OFF",
+            "-DBUILD_AGENT=OFF",
+            "-DBUILD_TESTING=OFF",
+        ],
+        check=True,
+    )
+    subprocess.run(
+        ["cmake", "--install", str(build), "--prefix", str(install)],
+        check=True,
+    )
+    installed = install / "share" / "hypertron_ros2_bridge" / "LICENSE"
+    assert installed.read_text(encoding="utf-8") == text

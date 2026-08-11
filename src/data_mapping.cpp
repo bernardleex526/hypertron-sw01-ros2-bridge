@@ -120,4 +120,8 @@ bool CameraIngestState::accept(const CameraChunkPayload& payload) {
   return !payload.data.empty();
 }
 
+bool effective_emergency_stop(bool pc_latched, bool agent_latched) noexcept {
+  return pc_latched || agent_latched;
+}
+
 }  // namespace hypertron_ros2_bridge

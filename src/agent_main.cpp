@@ -30,45 +30,6 @@ volatile std::sig_atomic_t g_signal_received = 0;
 
 extern "C" void handle_signal(int) { g_signal_received = 1; }
 
-class StdioByteStream final : public IByteStream {
- public:
-  std::vector<std::uint8_t> read_some() override {
-    std::vector<std::uint8_t> bytes(64U * 1024U);
-    const auto count = ::read(STDIN_FILENO, bytes.data(), bytes.size());
-    if (count <= 0) {
-      return {};
-    }
-    bytes.resize(static_cast<std::size_t>(count));
-    return bytes;
-  }
-
-  bool write_all(const std::vector<std::uint8_t>& bytes) override {
-    std::size_t offset{};
-    while (offset < bytes.size()) {
-      const auto count = ::write(STDOUT_FILENO, bytes.data() + offset,
-                                 bytes.size() - offset);
-      if (count < 0 && errno == EINTR) {
-        continue;
-      }
-      if (count <= 0) {
-        return false;
-      }
-      offset += static_cast<std::size_t>(count);
-    }
-    return true;
-  }
-
-  void close() noexcept override {
-    if (!closed_.exchange(true)) {
-      ::close(STDIN_FILENO);
-      ::close(STDOUT_FILENO);
-    }
-  }
-
- private:
-  std::atomic_bool closed_{false};
-};
-
 class UdpSocketSource final : public IUdpSource {
  public:
   UdpSocketSource(const std::string& bind_address, std::uint16_t port) {
@@ -319,7 +280,7 @@ int main(int argc, char** argv) {
       std::cerr << "WARNING: UDP 6101 odometry scale is not vendor-verified\n";
     }
     install_signal_handlers();
-    StdioByteStream stream;
+    PosixByteStream stream(STDIN_FILENO, STDOUT_FILENO, false);
     SteadyMonotonicClock clock;
     AstrallSdkAdapter sdk;
     std::unique_ptr<UdpSocketSource> lidar;
@@ -337,7 +298,7 @@ int main(int argc, char** argv) {
     }
     AgentUdpSources sources{camera.get(), lidar.get(), odometry.get()};
     AgentRuntime runtime(settings.agent, sdk, stream, clock, sources);
-    return runtime.run();
+    return runtime.run([] { return g_signal_received != 0; });
   } catch (const std::exception& error) {
     std::cerr << "hypertron_bridge_agent: " << error.what() << '\n';
     return 1;

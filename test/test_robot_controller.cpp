@@ -30,6 +30,7 @@ ControllerStatus ready_state() {
 TEST(RobotController, ClampsFiniteVelocityAndDeadmanReturnsZero) {
   ManualClock clock;
   RobotController controller({100ms}, clock);
+  controller.set_negotiated_ready(true);
   controller.update_robot_state(ready_state());
   EXPECT_EQ(controller.accept_velocity({2.0F, -2.0F, 0.5F}).value,
             (VelocityPayload{1.0F, -1.0F, 0.5F}));
@@ -40,6 +41,7 @@ TEST(RobotController, ClampsFiniteVelocityAndDeadmanReturnsZero) {
 TEST(RobotController, NonFiniteInputForcesZero) {
   ManualClock clock;
   RobotController controller({100ms}, clock);
+  controller.set_negotiated_ready(true);
   controller.update_robot_state(ready_state());
   const auto result =
       controller.accept_velocity({NAN, 0.0F, 0.0F});
@@ -51,6 +53,7 @@ TEST(RobotController, NonFiniteInputForcesZero) {
 TEST(RobotController, EstopLatchesAndClearDoesNotRestoreVelocity) {
   ManualClock clock;
   RobotController controller({100ms}, clock);
+  controller.set_negotiated_ready(true);
   controller.update_robot_state(ready_state());
   controller.accept_velocity({0.5F, 0.0F, 0.0F});
   EXPECT_TRUE(controller.trigger_estop().accepted);
@@ -62,6 +65,7 @@ TEST(RobotController, EstopLatchesAndClearDoesNotRestoreVelocity) {
 TEST(RobotController, MapsAllDocumentedModesCaseInsensitively) {
   ManualClock clock;
   RobotController controller({100ms}, clock);
+  controller.set_negotiated_ready(true);
   auto state = ready_state();
   state.sport_status = 0xB102U;
   controller.update_robot_state(state);
@@ -79,6 +83,7 @@ TEST(RobotController, MapsAllDocumentedModesCaseInsensitively) {
 TEST(RobotController, AuthorityLossAndFaultForceZero) {
   ManualClock clock;
   RobotController controller({100ms}, clock);
+  controller.set_negotiated_ready(true);
   auto state = ready_state();
   controller.update_robot_state(state);
   ASSERT_TRUE(controller.accept_velocity({0.5F, 0, 0}).accepted);
@@ -101,6 +106,39 @@ TEST(RobotController, JointPlaceholderRejectsWithoutCommand) {
   EXPECT_FALSE(controller.reject_joint_command("vendor SDK unavailable"));
   EXPECT_EQ(controller.rejected_joint_commands(), 1U);
   EXPECT_FALSE(controller.joint_interface_available());
+}
+
+TEST(RobotController, NegotiationInvalidationBlocksStaleRobotStateAndVelocity) {
+  ManualClock clock;
+  RobotController controller({100ms}, clock);
+  controller.update_robot_state(ready_state());
+  EXPECT_FALSE(controller.accept_velocity({0.4F, 0, 0}).accepted);
+
+  controller.set_negotiated_ready(true);
+  ASSERT_TRUE(controller.accept_velocity({0.4F, 0, 0}).accepted);
+  controller.set_negotiated_ready(false);
+  controller.update_robot_state(ready_state());
+  EXPECT_FALSE(controller.accept_velocity({0.2F, 0, 0}).accepted);
+  EXPECT_EQ(controller.velocity_for_tick().value, VelocityPayload{});
+}
+
+TEST(RobotController, ModeTransitionForcesZeroAndMoveRequiresFreshVelocity) {
+  ManualClock clock;
+  RobotController controller({100ms}, clock);
+  controller.set_negotiated_ready(true);
+  controller.update_robot_state(ready_state());
+  ASSERT_TRUE(controller.accept_velocity({0.6F, 0, 0}).accepted);
+
+  ASSERT_TRUE(controller.request_mode("stand").accepted);
+  EXPECT_EQ(controller.velocity_for_tick().value, VelocityPayload{});
+  EXPECT_FALSE(controller.accept_velocity({0.5F, 0, 0}).accepted);
+  controller.complete_mode_transition(false);
+  EXPECT_FALSE(controller.accept_velocity({0.4F, 0, 0}).accepted);
+
+  ASSERT_TRUE(controller.request_mode("move").accepted);
+  controller.complete_mode_transition(true);
+  EXPECT_EQ(controller.velocity_for_tick().value, VelocityPayload{});
+  EXPECT_TRUE(controller.accept_velocity({0.3F, 0, 0}).accepted);
 }
 
 }  // namespace

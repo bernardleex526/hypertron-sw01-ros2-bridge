@@ -229,7 +229,8 @@ struct DataReceiver::Impl {
     message.agent_connected = local.agent_connected;
     message.sdk_linked = payload.sdk_linked;
     message.control_authority = payload.control_authority;
-    message.emergency_stop = payload.emergency_stop;
+    message.emergency_stop = effective_emergency_stop(
+        local.emergency_stop_latched, payload.emergency_stop);
     message.joint_interface_available = false;
     message.camera_available = payload.camera_available;
     message.odometry_scale_verified = payload.odometry_scale_verified;
@@ -308,12 +309,14 @@ void DataReceiver::handle(const Frame& frame, std::uint64_t receive_time_ns) {
 #endif
     }
   } catch (const std::exception& error) {
-    if (frame.type == MessageType::CameraH264) {
-      impl_->camera_error_count.fetch_add(1);
+    const bool camera_error = frame.type == MessageType::CameraH264;
+    if (camera_error) impl_->camera_error_count.fetch_add(1);
+    {
+      std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      ++impl_->connection.protocol_rx_drops;
+      impl_->connection.last_error = error.what();
     }
-    std::lock_guard<std::mutex> lock(impl_->state_mutex);
-    ++impl_->connection.protocol_rx_drops;
-    impl_->connection.last_error = error.what();
+    if (!camera_error) throw;
   }
 }
 

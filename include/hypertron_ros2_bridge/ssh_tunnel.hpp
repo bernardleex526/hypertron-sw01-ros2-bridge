@@ -16,6 +16,11 @@
 
 namespace hypertron_ros2_bridge {
 
+namespace detail {
+enum class LibsshReadDisposition { Data, Again, Eof, Error };
+LibsshReadDisposition classify_libssh_read(int count) noexcept;
+}  // namespace detail
+
 struct SshConfig {
   std::string host;
   std::uint16_t port{22};

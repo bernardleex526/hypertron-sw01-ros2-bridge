@@ -26,7 +26,7 @@
 ## 验证矩阵
 
 - 纯 C++：6 个 CTest target 全部通过，覆盖队列、CRC/分帧/payload、控制门控、agent 生命周期/模式确认、SSH 重连/抢占/并发停止和数据映射。
-- Python 合同：3 个 pytest 全部通过，检查交付结构、ROS 接口声明、camera worker 和运维文档。
+- Python 合同：7 个 pytest 全部通过，检查交付结构、ROS 接口声明、camera worker、有效配置、仓库根命令、许可证安装和运维文档。
 - Sanitizer：ASan + UBSan 与 `-Wall -Wextra -Wpedantic -Werror` 运行全部纯测试通过。
 - ROS2：在 Ubuntu 22.04 / ROS2 Humble 上启用 libssh 0.9.6 和 FFmpeg，节点与自定义消息以 warnings-as-errors 完整编译、链接；`ldd` 确认 libssh/libavcodec/libswscale。
 - 厂家 SDK：x86_64 ASTRALL 1.0.7 实库完成 agent-only warnings-as-errors 编译/链接；`ldd` 不含 ROS2 或 libssh。
@@ -41,4 +41,3 @@
 2. 手册未定义 UDP 6100/6101 的字节序、packing、坐标系和固定点比例；必须抓包标定，完成前 `odometry_scale_verified=false`。
 3. 手册未定义 UDP 6000 数据报与 H.264 NAL/访问单元边界；FFmpeg parser 可容忍分片，但需实机验证丢包恢复和关键帧行为。
 4. ARM64 厂家库、目标机器人 SSH/权限、实体急停、悬空测试和 30 分钟断线/重连耐久测试必须在机器狗上完成。
-

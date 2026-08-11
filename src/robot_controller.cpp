@@ -85,7 +85,7 @@ EstopDecision RobotController::clear_estop() {
           "software emergency stop cleared; a new velocity is required"};
 }
 
-ModeDecision RobotController::request_mode(std::string_view name) const {
+ModeDecision RobotController::request_mode(std::string_view name) {
   static const std::unordered_map<std::string, std::uint16_t> kModes{
       {"damping", 0xA101U},     {"stand", 0xA102U},
       {"down", 0xA103U},        {"move", 0xA104U},
@@ -100,6 +100,14 @@ ModeDecision RobotController::request_mode(std::string_view name) const {
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
+  if (!negotiated_ready_) {
+    return {false, mode->second, BridgeError::Protocol,
+            "HELLO negotiation is not complete"};
+  }
+  if (mode_transition_pending_) {
+    return {false, mode->second, BridgeError::InvalidCommand,
+            "another mode transition is pending"};
+  }
   if (!status_.sdk_linked) {
     return {false, mode->second, BridgeError::SdkDisconnected,
             "ASTRALL SDK is disconnected"};
@@ -116,13 +124,44 @@ ModeDecision RobotController::request_mode(std::string_view name) const {
     return {false, mode->second, BridgeError::EmergencyStopLatched,
             "software emergency stop is latched"};
   }
+  mode_transition_pending_ = true;
+  pending_mode_ = mode->second;
+  motion_transition_gate_ = true;
+  force_zero_locked();
   return {true, mode->second, BridgeError::Protocol, {}};
+}
+
+void RobotController::complete_mode_transition(bool success) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const bool entered_move = success && mode_transition_pending_ &&
+                            pending_mode_ == 0xA104U;
+  mode_transition_pending_ = false;
+  pending_mode_ = 0;
+  motion_transition_gate_ = !entered_move;
+  force_zero_locked();
+}
+
+void RobotController::set_negotiated_ready(bool ready) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  negotiated_ready_ = ready;
+  if (!ready) {
+    mode_transition_pending_ = false;
+    pending_mode_ = 0;
+    motion_transition_gate_ = true;
+    force_zero_locked();
+  }
 }
 
 void RobotController::update_robot_state(const ControllerStatus& state) {
   std::lock_guard<std::mutex> lock(mutex_);
   const bool was_ready = movement_ready_locked();
   status_ = state;
+  if (!status_.sdk_linked || !status_.control_authority ||
+      status_.error_code != 0U) {
+    mode_transition_pending_ = false;
+    pending_mode_ = 0;
+    motion_transition_gate_ = true;
+  }
   if (was_ready != movement_ready_locked() || !movement_ready_locked()) {
     force_zero_locked();
   }
@@ -151,6 +190,10 @@ ControllerStatus RobotController::status() const {
 }
 
 VelocityDecision RobotController::rejection_locked() const {
+  if (!negotiated_ready_) {
+    return {false, {}, BridgeError::Protocol,
+            "HELLO negotiation is not complete"};
+  }
   if (!status_.sdk_linked) {
     return {false, {}, BridgeError::SdkDisconnected,
             "ASTRALL SDK is disconnected"};
@@ -167,12 +210,18 @@ VelocityDecision RobotController::rejection_locked() const {
     return {false, {}, BridgeError::EmergencyStopLatched,
             "software emergency stop is latched"};
   }
+  if (motion_transition_gate_ || mode_transition_pending_) {
+    return {false, {}, BridgeError::InvalidCommand,
+            "motion is gated by a mode transition"};
+  }
   return {false, {}, BridgeError::InvalidCommand,
           "robot is not in all-terrain Move state"};
 }
 
 bool RobotController::movement_ready_locked() const {
-  return status_.sdk_linked && status_.control_authority &&
+  return negotiated_ready_ && !motion_transition_gate_ &&
+         !mode_transition_pending_ && status_.sdk_linked &&
+         status_.control_authority &&
          status_.sport_status == kSportStateMove && status_.error_code == 0U &&
          !estop_latched_;
 }

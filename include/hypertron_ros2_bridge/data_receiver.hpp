@@ -75,6 +75,7 @@ ImuSample to_imu_sample(const ImuPayload& payload,
 OdometrySample to_odometry_sample(const OdometryPayload& payload,
                                   std::uint64_t receive_time_ns,
                                   const DataReceiverConfig& config);
+bool effective_emergency_stop(bool pc_latched, bool agent_latched) noexcept;
 
 class CameraIngestState {
  public:
@@ -94,6 +95,7 @@ struct ReceiverConnectionState {
   bool agent_connected{};
   std::uint32_t protocol_rx_drops{};
   std::uint32_t rejected_joint_commands{};
+  bool emergency_stop_latched{};
   std::string last_error;
 };
 

@@ -64,7 +64,9 @@ class RobotController {
   VelocityDecision velocity_for_tick() const;
   EstopDecision trigger_estop();
   EstopDecision clear_estop();
-  ModeDecision request_mode(std::string_view name) const;
+  ModeDecision request_mode(std::string_view name);
+  void complete_mode_transition(bool success);
+  void set_negotiated_ready(bool ready);
   void update_robot_state(const ControllerStatus& state);
 
   bool reject_joint_command(std::string_view reason);
@@ -86,6 +88,10 @@ class RobotController {
   IMonotonicClock::time_point last_velocity_time_{};
   bool has_velocity_{false};
   bool estop_latched_{false};
+  bool negotiated_ready_{false};
+  bool motion_transition_gate_{false};
+  bool mode_transition_pending_{false};
+  std::uint16_t pending_mode_{0};
   std::uint32_t rejected_joint_commands_{0};
   std::string last_joint_rejection_;
 };

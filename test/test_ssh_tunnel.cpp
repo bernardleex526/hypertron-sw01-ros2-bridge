@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -11,6 +12,10 @@
 #include <gtest/gtest.h>
 
 #include "hypertron_ros2_bridge/ssh_tunnel.hpp"
+
+#ifdef HYPERTRON_TEST_WITH_LIBSSH
+#include <libssh/libssh.h>
+#endif
 
 namespace hypertron_ros2_bridge {
 namespace {
@@ -159,6 +164,40 @@ class BurstBackend final : public ISshBackend {
   std::vector<std::vector<std::uint8_t>> writes_;
 };
 
+class ThrowingBackend final : public ISshBackend {
+ public:
+  ConnectResult connect(const SshConfig&) override {
+    return ConnectResult::Success;
+  }
+  bool write_all(const std::vector<std::uint8_t>&) override { return true; }
+  std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds) override {
+    throw std::runtime_error("injected SSH read failure");
+  }
+  bool send_keepalive() override { return true; }
+  void disconnect() noexcept override {}
+};
+
+class CallbackFrameBackend final : public ISshBackend {
+ public:
+  ConnectResult connect(const SshConfig&) override {
+    return ConnectResult::Success;
+  }
+  bool write_all(const std::vector<std::uint8_t>&) override { return true; }
+  std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds) override {
+    if (delivered_) return std::vector<std::uint8_t>{};
+    delivered_ = true;
+    return ProtocolHandler::encode(
+        {MessageType::RobotState, 1, 1, {0x01U}});
+  }
+  bool send_keepalive() override { return true; }
+  void disconnect() noexcept override {}
+
+ private:
+  bool delivered_{};
+};
+
 SshConfig config() {
   SshConfig value;
   value.host = "10.18.0.100";
@@ -268,6 +307,72 @@ TEST(SshTunnel, CountsProtocolCorruptionBeforeDisconnect) {
   ASSERT_TRUE(tunnel.start([](Frame) {}, [](ConnectionState, const std::string&) {}));
   std::this_thread::sleep_for(100ms);
   tunnel.stop();
+  EXPECT_EQ(tunnel.protocol_drops(), 1U);
+}
+
+TEST(SshTunnel, ClassifiesEveryLibsshNegativeReadBeforeSizingBuffer) {
+  using detail::LibsshReadDisposition;
+#ifdef HYPERTRON_TEST_WITH_LIBSSH
+  constexpr int again = SSH_AGAIN;
+  constexpr int eof = SSH_EOF;
+#else
+  constexpr int again = -2;
+  constexpr int eof = -127;
+#endif
+  EXPECT_EQ(detail::classify_libssh_read(12),
+            LibsshReadDisposition::Data);
+  EXPECT_EQ(detail::classify_libssh_read(0),
+            LibsshReadDisposition::Eof);
+  EXPECT_EQ(detail::classify_libssh_read(again),
+            LibsshReadDisposition::Again);
+  EXPECT_EQ(detail::classify_libssh_read(eof),
+            LibsshReadDisposition::Eof);
+  EXPECT_EQ(detail::classify_libssh_read(-1),
+            LibsshReadDisposition::Error);
+  EXPECT_EQ(detail::classify_libssh_read(-99),
+            LibsshReadDisposition::Error);
+}
+
+TEST(SshTunnel, WorkerExceptionBecomesDisconnectInsteadOfTermination) {
+  ThrowingBackend backend;
+  FakeSleeper sleeper;
+  sleeper.continue_sleep = false;
+  SshTunnel tunnel(config(), backend, sleeper);
+  std::atomic_bool disconnected{false};
+  ASSERT_TRUE(tunnel.start(
+      [](Frame) {},
+      [&](ConnectionState state, const std::string& detail) {
+        if (state == ConnectionState::Disconnected &&
+            detail.find("injected SSH read failure") != std::string::npos) {
+          disconnected.store(true);
+        }
+      }));
+  for (int attempt = 0; attempt < 100 && !disconnected.load(); ++attempt) {
+    std::this_thread::sleep_for(5ms);
+  }
+  tunnel.stop();
+  EXPECT_TRUE(disconnected.load());
+}
+
+TEST(SshTunnel, CallbackProtocolFailureIsRecordedOnDisconnect) {
+  CallbackFrameBackend backend;
+  FakeSleeper sleeper;
+  sleeper.continue_sleep = false;
+  SshTunnel tunnel(config(), backend, sleeper);
+  std::atomic_bool recorded{false};
+  ASSERT_TRUE(tunnel.start(
+      [](Frame) { throw ProtocolError("malformed RobotState payload"); },
+      [&](ConnectionState state, const std::string& detail) {
+        if (state == ConnectionState::Disconnected &&
+            detail.find("malformed RobotState payload") != std::string::npos) {
+          recorded.store(true);
+        }
+      }));
+  for (int attempt = 0; attempt < 100 && !recorded.load(); ++attempt) {
+    std::this_thread::sleep_for(5ms);
+  }
+  tunnel.stop();
+  EXPECT_TRUE(recorded.load());
   EXPECT_EQ(tunnel.protocol_drops(), 1U);
 }
 

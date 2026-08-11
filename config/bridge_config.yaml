@@ -24,10 +24,7 @@ hypertron_bridge:
       heartbeat_hz: 10.0
       motion_refresh_hz: 50.0
       state_poll_hz: 2.0
-      imu_frequency: 125
-      sport_frequency: 50
       auto_acquire_control: true
-      auto_prepare_motion: false
 
     topics:
       cmd_vel: "/cmd_vel"
@@ -76,5 +73,3 @@ hypertron_bridge:
       enabled: false
       bind_address: "0.0.0.0"
       port: 6000
-      output_encoding: "bgr8"
-      queue_capacity: 2

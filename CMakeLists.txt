@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-install(FILES README.md SW01_MANUAL_NOTES.md HTBR_PROTOCOL.md REVIEW.md
+install(FILES README.md SW01_MANUAL_NOTES.md HTBR_PROTOCOL.md REVIEW.md LICENSE
   DESTINATION share/${PROJECT_NAME})
 
 include(CTest)
@@ -25,7 +25,8 @@ target_include_directories(hypertron_protocol PUBLIC
 
 add_library(hypertron_agent_core STATIC
   src/agent_runtime.cpp
-  src/astrall_sdk_adapter.cpp)
+  src/astrall_sdk_adapter.cpp
+  src/posix_byte_stream.cpp)
 target_include_directories(hypertron_agent_core PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
@@ -87,6 +88,11 @@ if(BUILD_ROS2_BRIDGE)
 
   target_compile_definitions(hypertron_ssh PRIVATE HYPERTRON_WITH_LIBSSH=1)
   target_link_libraries(hypertron_ssh PRIVATE PkgConfig::LIBSSH)
+  if(BUILD_TESTING)
+    target_compile_definitions(test_ssh_tunnel PRIVATE
+      HYPERTRON_TEST_WITH_LIBSSH=1)
+    target_link_libraries(test_ssh_tunnel PRIVATE PkgConfig::LIBSSH)
+  endif()
 
   rosidl_generate_interfaces(${PROJECT_NAME}
     "msg/RobotState.msg"

@@ -496,6 +496,22 @@ HelloAckPayload decode_hello_ack(const std::vector<std::uint8_t>& bytes) {
   r.finish();
   return p;
 }
+
+void validate_hello_ack(const HelloAckPayload& payload,
+                        std::uint32_t expected_nonce,
+                        std::uint32_t requested_capabilities) {
+  validate_capabilities(payload.capabilities);
+  validate_capabilities(requested_capabilities);
+  if (payload.selected_version != kBridgeProtocolVersion) {
+    throw ProtocolError("agent selected an incompatible HTBR version");
+  }
+  if (payload.instance_nonce != expected_nonce) {
+    throw ProtocolError("agent HELLO_ACK nonce does not match this session");
+  }
+  if ((payload.capabilities & ~requested_capabilities) != 0U) {
+    throw ProtocolError("agent HELLO_ACK contains unrequested capabilities");
+  }
+}
 std::vector<std::uint8_t> encode_velocity(const VelocityPayload& p) {
   Writer w;
   write_f32_array(w, std::array<float, 3>{p.vx, p.vy, p.vyaw});

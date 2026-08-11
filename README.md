@@ -27,17 +27,17 @@ HTBR 是 SSH exec channel 上的版本化二进制帧，不是厂家 UDP 3600 �
 
 ## ROS2 接口
 
-| 接口 | 类型 | 行为 |
-|---|---|---|
-| `/cmd_vel` | `geometry_msgs/msg/Twist` | 使用 `linear.x`、`linear.y`、`angular.z`，限幅到 `[-1, 1]`；100 ms deadman。 |
-| `/robot_mode` | `std_msgs/msg/String` | `damping/stand/down/move/auto_charge/exit_charge/recover`（兼容 `recovery`）。 |
-| `/emergency_stop` | `std_srvs/srv/SetBool` | `true` 锁存零速并请求阻尼；`false` 只解除软件锁存。 |
-| `/joint_commands` | `sensor_msgs/msg/JointState` | 明确拒绝，不向机器人发送。 |
-| `/imu/data` | `sensor_msgs/msg/Imu` | SensorDataQoS，校验并归一化四元数。 |
-| `/joint_states` | `sensor_msgs/msg/JointState` | 保留 publisher，当前静默。 |
-| `/odom` | `nav_msgs/msg/Odometry` | UDP 6101；比例未确认时状态标记为 false。 |
-| `/robot_state` | `hypertron_ros2_bridge/msg/RobotState` | 连接、SDK、控制权、错误、状态与安全标记。 |
-| `/camera/image_raw` | `sensor_msgs/msg/Image` | 仅在相机启用且硬件支持时发布 BGR8。 |
+| 接口 | 方向 | 类型 | 实际 QoS | 行为 |
+|---|---|---|---|---|
+| `/cmd_vel` | PC -> agent | `geometry_msgs/msg/Twist` | Reliable, Volatile, KeepLast(1) | 使用 `linear.x`、`linear.y`、`angular.z`，限幅到 `[-1, 1]`；100 ms deadman。 |
+| `/robot_mode` | PC -> agent | `std_msgs/msg/String` | Reliable, Volatile, KeepLast(10) | `damping/stand/down/move/auto_charge/exit_charge/recover`（兼容 `recovery`）。 |
+| `/emergency_stop` | PC -> agent | `std_srvs/srv/SetBool` | ROS service default: Reliable, Volatile, KeepLast(10) | `true` 锁存零速并请求阻尼；`false` 只解除软件锁存。 |
+| `/joint_commands` | PC -> local rejection | `sensor_msgs/msg/JointState` | Reliable, Volatile, KeepLast(1) | 明确拒绝，不向机器人发送。 |
+| `/imu/data` | agent -> PC | `sensor_msgs/msg/Imu` | SensorDataQoS: BestEffort, Volatile, KeepLast(5) | 校验并归一化四元数。 |
+| `/joint_states` | local silent publisher | `sensor_msgs/msg/JointState` | SensorDataQoS: BestEffort, Volatile, KeepLast(5) | 保留 publisher，当前静默。 |
+| `/odom` | agent -> PC | `nav_msgs/msg/Odometry` | SensorDataQoS: BestEffort, Volatile, KeepLast(5) | UDP 6101；比例未确认时状态标记为 false。 |
+| `/robot_state` | agent -> PC | `hypertron_ros2_bridge/msg/RobotState` | Reliable, Volatile, KeepLast(10) | 连接、SDK、控制权、错误、状态与安全标记。 |
+| `/camera/image_raw` | agent -> PC | `sensor_msgs/msg/Image` | SensorDataQoS: BestEffort, Volatile, KeepLast(5) | 仅在相机启用且硬件支持时发布 BGR8。 |
 
 ## ROS2 指令到 ASTRALL 对照
 
@@ -95,7 +95,7 @@ ssh -o StrictHostKeyChecking=yes <ROBOT_USER>@<ROBOT_IP> 'true'
 ```bash
 source /opt/ros/humble/setup.bash
 mkdir -p <HYPERTRON_WS>/src
-cp -a hypertron_ros2_bridge <HYPERTRON_WS>/src/
+git clone <REPOSITORY_URL> <HYPERTRON_WS>/src/hypertron_ros2_bridge
 cd <HYPERTRON_WS>
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --packages-select hypertron_ros2_bridge --symlink-install \
@@ -104,6 +104,12 @@ source install/setup.bash
 ```
 
 不要为了规避依赖检查而跳过 `rosdep`。相机仅在已完成 SOP 6 的相机门禁后，才允许重新构建并启用。
+
+Ubuntu 22.04 的 PC 构建依赖至少包括 `libssh-dev`。只有在明确启用 `ENABLE_CAMERA=ON` 时，还要安装 FFmpeg 开发包：
+
+```bash
+sudo apt install libssh-dev libavcodec-dev libavutil-dev libswscale-dev
+```
 
 ## SOP 3：机器人端 ARM64 agent 部署
 
@@ -139,6 +145,14 @@ camera:
 
 密码应通过受控环境变量或密钥管理提供，不能写入 YAML。核对 `agent_startup_timeout_ms: 65000`、稳态应用心跳超时 500 ms、`heartbeat_hz: 10.0`、`motion_refresh_hz: 50.0` 和 `command_deadman_ms: 100`。
 
+以下行为是代码固定值，不是 YAML 选项，避免产生静默无效配置：
+
+- IMU subscription: fixed at 125 Hz
+- sport subscription: fixed at 50 Hz
+- automatic motion preparation: disabled
+- camera decode queue: fixed capacity 2
+- camera output encoding: fixed BGR8
+
 ## SOP 5：启动、状态门禁与首次低速运动
 
 启动和检查需要使用独立终端；不要把前台 bridge、持续 `ros2 topic echo` 与后续命令放在同一串命令中。
@@ -173,8 +187,14 @@ ros2 topic pub --once /robot_mode std_msgs/msg/String "{data: move}"
 ros2 topic echo --once /robot_state
 ros2 topic pub --rate 20 /cmd_vel geometry_msgs/msg/Twist \
   "{linear: {x: 0.10, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}"
+```
+
+Press Ctrl+C in the velocity publisher terminal before continuing. Then use a separate command block (or another terminal) to send zero, confirm state, and engage software emergency stop:
+
+```bash
 ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist \
   "{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}"
+ros2 topic echo --once /robot_state
 ros2 service call /emergency_stop std_srvs/srv/SetBool "{data: true}"
 ```
 
@@ -197,10 +217,11 @@ ros2 service call /emergency_stop std_srvs/srv/SetBool "{data: true}"
 纯核心测试和发布合同：
 
 ```bash
-cmake -S hypertron_ros2_bridge -B build-pure -DBUILD_ROS2_BRIDGE=OFF -DBUILD_AGENT=OFF -DBUILD_TESTING=ON
+cd <HYPERTRON_WS>/src/hypertron_ros2_bridge
+cmake -S . -B build-pure -DBUILD_ROS2_BRIDGE=OFF -DBUILD_AGENT=OFF -DBUILD_TESTING=ON
 cmake --build build-pure -j
 ctest --test-dir build-pure --output-on-failure
-python -m pytest hypertron_ros2_bridge/test/test_package_contract.py -q
+python -m pytest test/test_package_contract.py -q
 ```
 
 [REVIEW.md](REVIEW.md) 记录代码审查与已知硬件门禁；[SW01_MANUAL_NOTES.md](SW01_MANUAL_NOTES.md) 是厂家材料索引，不替代原始厂家资料。

@@ -216,6 +216,24 @@ TEST(PayloadCodec, RejectsMalformedAndNonFinitePayloads) {
                ProtocolError);
 }
 
+TEST(PayloadCodec, HelloAckMustMatchNonceAndRequestedCapabilities) {
+  const std::uint32_t requested =
+      CapabilityImu | CapabilitySystemState;
+  EXPECT_NO_THROW(validate_hello_ack(
+      {kBridgeProtocolVersion, CapabilitySystemState, 0x12345678U, "sdk"},
+      0x12345678U, requested));
+  EXPECT_THROW(validate_hello_ack(
+                   {kBridgeProtocolVersion, CapabilitySystemState,
+                    0x87654321U, "sdk"},
+                   0x12345678U, requested),
+               ProtocolError);
+  EXPECT_THROW(validate_hello_ack(
+                   {kBridgeProtocolVersion, CapabilityCamera,
+                    0x12345678U, "sdk"},
+                   0x12345678U, requested),
+               ProtocolError);
+}
+
 TEST(Sw01Udp, ParsesPackedOdometryAndNormalizesQuaternion) {
   const auto odom = parse_odometry_packet(
       packed_odometry_fixture(), PackingMode::Auto, 1e-6, 1e-6);

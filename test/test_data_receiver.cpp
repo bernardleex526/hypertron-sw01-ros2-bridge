@@ -86,5 +86,12 @@ TEST(DataReceiver, CameraDisabledIsNonFatalAndCountsDrop) {
   EXPECT_EQ(state.disabled_drops(), 1U);
 }
 
+TEST(DataReceiver, PcEmergencyLatchDominatesAgentAndDisconnectState) {
+  EXPECT_FALSE(effective_emergency_stop(false, false));
+  EXPECT_TRUE(effective_emergency_stop(true, false));
+  EXPECT_TRUE(effective_emergency_stop(false, true));
+  EXPECT_TRUE(effective_emergency_stop(true, true));
+}
+
 }  // namespace
 }  // namespace hypertron_ros2_bridge

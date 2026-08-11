@@ -189,6 +189,9 @@ std::vector<std::uint8_t> encode_hello(const HelloPayload& payload);
 HelloPayload decode_hello(const std::vector<std::uint8_t>& bytes);
 std::vector<std::uint8_t> encode_hello_ack(const HelloAckPayload& payload);
 HelloAckPayload decode_hello_ack(const std::vector<std::uint8_t>& bytes);
+void validate_hello_ack(const HelloAckPayload& payload,
+                        std::uint32_t expected_nonce,
+                        std::uint32_t requested_capabilities);
 std::vector<std::uint8_t> encode_velocity(const VelocityPayload& payload);
 VelocityPayload decode_velocity(const std::vector<std::uint8_t>& bytes);
 std::vector<std::uint8_t> encode_mode(const ModePayload& payload);

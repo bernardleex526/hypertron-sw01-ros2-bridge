@@ -88,10 +88,28 @@ class AstrallSdkAdapter final : public IAstrallSdk {
 class IByteStream {
  public:
   virtual ~IByteStream() = default;
-  // An empty result denotes EOF or a permanent stream error.
-  virtual std::vector<std::uint8_t> read_some() = 0;
+  // nullopt denotes EOF/permanent error; an empty vector is a timeout/wakeup.
+  virtual std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds timeout) = 0;
   virtual bool write_all(const std::vector<std::uint8_t>& bytes) = 0;
   virtual void close() noexcept = 0;
+};
+
+class PosixByteStream final : public IByteStream {
+ public:
+  PosixByteStream(int input_fd, int output_fd, bool own_data_fds);
+  ~PosixByteStream() override;
+  PosixByteStream(const PosixByteStream&) = delete;
+  PosixByteStream& operator=(const PosixByteStream&) = delete;
+
+  std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds timeout) override;
+  bool write_all(const std::vector<std::uint8_t>& bytes) override;
+  void close() noexcept override;
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
 };
 
 struct UdpDatagram {
@@ -142,7 +160,7 @@ class AgentRuntime {
   AgentRuntime(const AgentRuntime&) = delete;
   AgentRuntime& operator=(const AgentRuntime&) = delete;
 
-  int run();
+  int run(std::function<bool()> external_stop_requested = {});
   void request_stop() noexcept;
   void step_for(std::chrono::milliseconds duration);
 

@@ -5,9 +5,12 @@
 #include <cstdint>
 #include <future>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -28,7 +31,11 @@ class ManualClock final : public IMonotonicClock {
 
 class FakeSdk : public IAstrallSdk {
  public:
-  std::uint16_t init(const SdkCallbacks&, std::uint32_t) override {
+  std::uint16_t init(const SdkCallbacks& callbacks, std::uint32_t) override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      callbacks_ = callbacks;
+    }
     record("init");
     return kAstrallSuccess;
   }
@@ -66,6 +73,14 @@ class FakeSdk : public IAstrallSdk {
   }
   std::string sdk_version() const override { return "fake-1"; }
   void set_sport_status(std::uint16_t value) { sport_status_.store(value); }
+  void emit_imu(ImuPayload value) {
+    std::function<void(ImuPayload)> callback;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      callback = callbacks_.on_imu;
+    }
+    if (callback) callback(std::move(value));
+  }
 
   std::vector<std::string> calls() const {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -90,12 +105,16 @@ class FakeSdk : public IAstrallSdk {
   }
   mutable std::mutex mutex_;
   std::vector<std::string> calls_;
+  SdkCallbacks callbacks_;
   std::atomic<std::uint16_t> sport_status_{0xB104U};
 };
 
 class EofStream final : public IByteStream {
  public:
-  std::vector<std::uint8_t> read_some() override { return {}; }
+  std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds) override {
+    return std::nullopt;
+  }
   bool write_all(const std::vector<std::uint8_t>& bytes) override {
     writes_.push_back(bytes);
     return true;
@@ -112,8 +131,9 @@ class ScriptStream final : public IByteStream {
  public:
   explicit ScriptStream(std::vector<std::uint8_t> script)
       : script_(std::move(script)) {}
-  std::vector<std::uint8_t> read_some() override {
-    if (delivered_) return {};
+  std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds) override {
+    if (delivered_) return std::nullopt;
     delivered_ = true;
     return script_;
   }
@@ -132,10 +152,19 @@ class ScriptStream final : public IByteStream {
 
 class BlockingFailedWriterStream final : public IByteStream {
  public:
-  std::vector<std::uint8_t> read_some() override {
+  std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds timeout) override {
     std::unique_lock<std::mutex> lock(mutex_);
-    cv_.wait(lock, [this] { return closed_; });
-    return {};
+    if (!delivered_) {
+      delivered_ = true;
+      return ProtocolHandler::encode(
+          {MessageType::Hello, 1, 1,
+           encode_hello({1, 1, CapabilitySystemState, 7})});
+    }
+    if (!cv_.wait_for(lock, timeout, [this] { return closed_; })) {
+      return std::vector<std::uint8_t>{};
+    }
+    return std::nullopt;
   }
   bool write_all(const std::vector<std::uint8_t>&) override { return false; }
   void close() noexcept override {
@@ -150,6 +179,7 @@ class BlockingFailedWriterStream final : public IByteStream {
   std::mutex mutex_;
   std::condition_variable cv_;
   bool closed_{};
+  bool delivered_{};
 };
 
 class ModeStream final : public IByteStream {
@@ -157,14 +187,17 @@ class ModeStream final : public IByteStream {
   explicit ModeStream(std::vector<std::uint8_t> script)
       : script_(std::move(script)) {}
 
-  std::vector<std::uint8_t> read_some() override {
+  std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds timeout) override {
     std::unique_lock<std::mutex> lock(mutex_);
     if (!delivered_) {
       delivered_ = true;
       return script_;
     }
-    cv_.wait(lock, [this] { return closed_; });
-    return {};
+    if (!cv_.wait_for(lock, timeout, [this] { return closed_; })) {
+      return std::vector<std::uint8_t>{};
+    }
+    return std::nullopt;
   }
 
   bool write_all(const std::vector<std::uint8_t>& bytes) override {
@@ -207,6 +240,83 @@ class ModeStream final : public IByteStream {
   std::condition_variable cv_;
   std::vector<std::vector<std::uint8_t>> writes_;
   bool delivered_{};
+  bool closed_{};
+};
+
+class InteractiveStream final : public IByteStream {
+ public:
+  std::optional<std::vector<std::uint8_t>> read_some(
+      std::chrono::milliseconds timeout) override {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!cv_.wait_for(lock, timeout,
+                      [this] { return closed_ || !inputs_.empty(); })) {
+      return std::vector<std::uint8_t>{};
+    }
+    if (inputs_.empty()) return std::nullopt;
+    auto bytes = std::move(inputs_.front());
+    inputs_.erase(inputs_.begin());
+    return bytes;
+  }
+
+  bool write_all(const std::vector<std::uint8_t>& bytes) override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      writes_.push_back(bytes);
+    }
+    cv_.notify_all();
+    return true;
+  }
+
+  void close() noexcept override {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      closed_ = true;
+    }
+    cv_.notify_all();
+  }
+
+  void push(Frame frame) {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      inputs_.push_back(ProtocolHandler::encode(frame));
+    }
+    cv_.notify_all();
+  }
+
+  bool wait_for_frame(MessageType type, std::uint32_t request_sequence,
+                      std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, timeout, [&] {
+      for (const auto& bytes : writes_) {
+        ProtocolHandler decoder;
+        for (const auto& frame : decoder.feed(bytes)) {
+          if (frame.type != type) continue;
+          if (type == MessageType::Error &&
+              decode_error(frame.payload).request_sequence == request_sequence) {
+            return true;
+          }
+          if (type == MessageType::HelloAck) return true;
+        }
+      }
+      return false;
+    });
+  }
+
+  std::vector<Frame> written_frames() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::vector<Frame> result;
+    ProtocolHandler decoder;
+    for (const auto& bytes : writes_) {
+      for (auto& frame : decoder.feed(bytes)) result.push_back(std::move(frame));
+    }
+    return result;
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  std::vector<std::vector<std::uint8_t>> inputs_;
+  std::vector<std::vector<std::uint8_t>> writes_;
   bool closed_{};
 };
 
@@ -351,6 +461,164 @@ TEST(AgentRuntime, EnablesVendorLidarSubscriptionBeforeUdpReceive) {
   ASSERT_NE(acquire, calls.end());
   EXPECT_LT(init, udp);
   EXPECT_LT(udp, acquire);
+}
+
+TEST(AgentRuntime, TelemetryIsSilentUntilHelloCompletes) {
+  FakeSdk sdk;
+  InteractiveStream stream;
+  SteadyMonotonicClock clock;
+  auto agent_config = config();
+  agent_config.state_period = 10ms;
+  AgentRuntime agent(agent_config, sdk, stream, clock);
+  auto run = std::async(std::launch::async, [&agent] { return agent.run(); });
+  for (int attempt = 0; attempt < 100 && sdk.count("init") == 0U; ++attempt) {
+    std::this_thread::sleep_for(2ms);
+  }
+  ImuPayload imu;
+  imu.quaternion = {0, 0, 0, 1};
+  sdk.emit_imu(imu);
+  std::this_thread::sleep_for(60ms);
+  agent.request_stop();
+  EXPECT_EQ(run.get(), 0);
+  for (const auto& frame : stream.written_frames()) {
+    EXPECT_TRUE(frame.type == MessageType::HelloAck ||
+                frame.type == MessageType::Ack ||
+                frame.type == MessageType::Error ||
+                frame.type == MessageType::Pong);
+  }
+}
+
+TEST(AgentRuntime, HelloAckIsRequestedRuntimeCapabilityIntersection) {
+  FakeSdk sdk;
+  InteractiveStream stream;
+  SteadyMonotonicClock clock;
+  AgentRuntime agent(config(), sdk, stream, clock);
+  auto run = std::async(std::launch::async, [&agent] { return agent.run(); });
+  constexpr std::uint32_t requested = CapabilityOdometry | CapabilityCamera |
+                                      CapabilitySystemState;
+  stream.push({MessageType::Hello, 10, 1,
+               encode_hello({1, 1, requested, 0x55AAU})});
+  ASSERT_TRUE(stream.wait_for_frame(MessageType::HelloAck, 0, 500ms));
+  agent.request_stop();
+  EXPECT_EQ(run.get(), 0);
+
+  const auto frames = stream.written_frames();
+  const auto ack = std::find_if(frames.begin(), frames.end(), [](const Frame& f) {
+    return f.type == MessageType::HelloAck;
+  });
+  ASSERT_NE(ack, frames.end());
+  EXPECT_EQ(decode_hello_ack(ack->payload).capabilities,
+            CapabilitySystemState);
+}
+
+TEST(AgentRuntime, UnnegotiatedTelemetryCapabilityRemainsSilent) {
+  FakeSdk sdk;
+  InteractiveStream stream;
+  SteadyMonotonicClock clock;
+  AgentRuntime agent(config(), sdk, stream, clock);
+  auto run = std::async(std::launch::async, [&agent] { return agent.run(); });
+  stream.push({MessageType::Hello, 10, 1,
+               encode_hello({1, 1, CapabilitySystemState, 0x55AAU})});
+  ASSERT_TRUE(stream.wait_for_frame(MessageType::HelloAck, 0, 500ms));
+  ImuPayload imu;
+  imu.quaternion = {0, 0, 0, 1};
+  sdk.emit_imu(imu);
+  std::this_thread::sleep_for(40ms);
+  agent.request_stop();
+  EXPECT_EQ(run.get(), 0);
+  for (const auto& frame : stream.written_frames()) {
+    EXPECT_NE(frame.type, MessageType::Imu);
+  }
+}
+
+TEST(AgentRuntime, ModeTimeoutKeepsZeroDespiteNewVelocityFrames) {
+  FakeSdk sdk;
+  InteractiveStream stream;
+  SteadyMonotonicClock clock;
+  auto agent_config = config();
+  agent_config.application_timeout = 2s;
+  agent_config.mode_timeout = 80ms;
+  agent_config.mode_poll_period = 5ms;
+  agent_config.state_period = 2s;
+  AgentRuntime agent(agent_config, sdk, stream, clock);
+  auto run = std::async(std::launch::async, [&agent] { return agent.run(); });
+  stream.push({MessageType::Hello, 1, 1,
+               encode_hello({1, 1, CapabilitySystemState, 7})});
+  ASSERT_TRUE(stream.wait_for_frame(MessageType::HelloAck, 0, 500ms));
+  stream.push({MessageType::CmdVelocity, 2, 2,
+               encode_velocity({0.6F, 0, 0})});
+  for (int attempt = 0;
+       attempt < 100 && sdk.count("move:0.600000,0.000000,0.000000") == 0U;
+       ++attempt) {
+    std::this_thread::sleep_for(2ms);
+  }
+  ASSERT_GT(sdk.count("move:0.600000,0.000000,0.000000"), 0U);
+
+  stream.push({MessageType::CmdMode, 3, 3, encode_mode({0xA102U})});
+  stream.push({MessageType::CmdVelocity, 4, 4,
+               encode_velocity({0.8F, 0, 0})});
+  ASSERT_TRUE(stream.wait_for_frame(MessageType::Error, 3, 1s));
+  std::this_thread::sleep_for(60ms);
+  agent.request_stop();
+  EXPECT_EQ(run.get(), 0);
+
+  const auto calls = sdk.calls();
+  const auto mode = std::find(calls.begin(), calls.end(), "mode:41218");
+  ASSERT_NE(mode, calls.end());
+  ASSERT_NE(mode, calls.begin());
+  EXPECT_EQ(*(mode - 1), "move:0.000000,0.000000,0.000000");
+  for (auto call = mode + 1; call != calls.end(); ++call) {
+    if (call->rfind("move:", 0) == 0) {
+      EXPECT_EQ(*call, "move:0.000000,0.000000,0.000000");
+    }
+  }
+}
+
+TEST(AgentRuntime, RequestStopWakesARealPipeAndRunsSafeShutdown) {
+  int input_pipe[2]{};
+  int output_pipe[2]{};
+  ASSERT_EQ(::pipe(input_pipe), 0);
+  ASSERT_EQ(::pipe(output_pipe), 0);
+  FakeSdk sdk;
+  PosixByteStream stream(input_pipe[0], output_pipe[1], true);
+  SteadyMonotonicClock clock;
+  AgentRuntime agent(config(), sdk, stream, clock);
+  auto run = std::async(std::launch::async, [&agent] { return agent.run(); });
+  for (int attempt = 0; attempt < 100 && sdk.count("init") == 0U; ++attempt) {
+    std::this_thread::sleep_for(2ms);
+  }
+  agent.request_stop();
+  EXPECT_EQ(run.wait_for(500ms), std::future_status::ready);
+  EXPECT_EQ(run.get(), 0);
+  const auto calls = sdk.calls();
+  ASSERT_GE(calls.size(), 3U);
+  EXPECT_EQ(calls[calls.size() - 3U],
+            "move:0.000000,0.000000,0.000000");
+  EXPECT_EQ(calls[calls.size() - 2U], "mode:41217");
+  EXPECT_EQ(calls.back(), "deinit");
+  ::close(input_pipe[1]);
+  ::close(output_pipe[0]);
+}
+
+TEST(AgentRuntime, ExternalSignalPredicateStopsTimedPipeRead) {
+  int input_pipe[2]{};
+  int output_pipe[2]{};
+  ASSERT_EQ(::pipe(input_pipe), 0);
+  ASSERT_EQ(::pipe(output_pipe), 0);
+  FakeSdk sdk;
+  PosixByteStream stream(input_pipe[0], output_pipe[1], true);
+  SteadyMonotonicClock clock;
+  AgentRuntime agent(config(), sdk, stream, clock);
+  std::atomic_bool signal_received{false};
+  auto run = std::async(std::launch::async, [&] {
+    return agent.run([&] { return signal_received.load(); });
+  });
+  std::this_thread::sleep_for(30ms);
+  signal_received.store(true);
+  EXPECT_EQ(run.wait_for(500ms), std::future_status::ready);
+  EXPECT_EQ(run.get(), 0);
+  ::close(input_pipe[1]);
+  ::close(output_pipe[0]);
 }
 
 }  // namespace

@@ -3,7 +3,7 @@
   <name>hypertron_ros2_bridge</name>
   <version>0.1.0</version>
   <description>SSH bridge between ROS2 and the Hypertron SW01 ASTRALL SDK.</description>
-  <maintainer email="maintainer@example.com">Hypertron Bridge Maintainer</maintainer>
+  <maintainer email="bernardleex526@users.noreply.github.com">Hypertron Bridge Maintainer</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>

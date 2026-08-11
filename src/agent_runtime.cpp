@@ -81,6 +81,7 @@ struct AgentRuntime::Impl {
   std::atomic_bool stop{false};
   std::atomic_bool initialized{false};
   std::atomic_bool handshake_complete{false};
+  std::atomic<std::uint32_t> negotiated_capabilities{0};
   std::atomic_bool application_timed_out{false};
   std::atomic<std::uint32_t> next_sequence{1};
   std::atomic<std::uint32_t> last_velocity_sequence{0};
@@ -97,6 +98,21 @@ struct AgentRuntime::Impl {
   std::string get_last_error() {
     std::lock_guard<std::mutex> lock(error_mutex);
     return last_error;
+  }
+
+  std::uint32_t runtime_capabilities() const noexcept {
+    std::uint32_t capabilities =
+        CapabilityImu | CapabilitySport | CapabilitySystemState;
+    if (udp.odometry != nullptr) capabilities |= CapabilityOdometry;
+    if (config.camera_enabled && udp.camera != nullptr) {
+      capabilities |= CapabilityCamera;
+    }
+    return capabilities;
+  }
+
+  bool negotiated(std::uint32_t capability) const noexcept {
+    return handshake_complete.load() &&
+           (negotiated_capabilities.load() & capability) != 0U;
   }
 
   Frame make_frame(MessageType type, std::vector<std::uint8_t> payload = {}) {
@@ -127,6 +143,7 @@ struct AgentRuntime::Impl {
       controller.update_robot_state(state);
     };
     value.on_imu = [this](ImuPayload payload) {
+      if (!negotiated(CapabilityImu)) return;
       try {
         sensor_output.push(make_frame(MessageType::Imu, encode_imu(payload)));
       } catch (const std::exception& error) {
@@ -134,6 +151,7 @@ struct AgentRuntime::Impl {
       }
     };
     value.on_sport = [this](SportPayload payload) {
+      if (!negotiated(CapabilitySport)) return;
       try {
         auto state = controller.status();
         payload.sport_status = state.sport_status;
@@ -197,7 +215,7 @@ struct AgentRuntime::Impl {
       snapshot = sdk.snapshot();
     }
     controller.update_robot_state(controller_status(snapshot));
-    if (publish) {
+    if (publish && negotiated(CapabilitySystemState)) {
       RobotStatePayload state;
       state.sdk_linked = snapshot.sdk_linked;
       state.control_authority = snapshot.control_authority;
@@ -248,18 +266,16 @@ struct AgentRuntime::Impl {
                    "no compatible HTBR protocol version");
         return;
       }
-      std::uint32_t capabilities = CapabilityImu | CapabilitySport |
-                                   CapabilityOdometry | CapabilitySystemState;
-      if (config.camera_enabled && udp.camera != nullptr) {
-        capabilities |= CapabilityCamera;
-      }
+      const auto capabilities = hello.capabilities & runtime_capabilities();
       // The JOINT capability deliberately remains clear until the vendor
       // publishes a low-level joint SDK and message semantics.
       enqueue_control(make_frame(
           MessageType::HelloAck,
           encode_hello_ack({kBridgeProtocolVersion, capabilities,
                             hello.instance_nonce, sdk.sdk_version()})));
+      negotiated_capabilities.store(capabilities);
       handshake_complete.store(true);
+      controller.set_negotiated_ready(true);
       return;
     }
     if (frame.type == MessageType::Ping || frame.type == MessageType::Pong) {
@@ -273,7 +289,7 @@ struct AgentRuntime::Impl {
       }
       return;
     }
-    if (!handshake_complete.load()) {
+    if (!handshake_complete.load() && frame.type != MessageType::CmdEstop) {
       send_error(frame.sequence, BridgeError::Protocol,
                  "HELLO handshake is required before commands");
       return;
@@ -333,6 +349,7 @@ struct AgentRuntime::Impl {
       }
       if (!mode_requests.push({frame.sequence, decision.mode, expected_status,
                                std::string(mode_name)})) {
+        controller.complete_mode_transition(false);
         send_error(frame.sequence, BridgeError::InvalidCommand,
                    "mode request queue is full");
       }
@@ -434,18 +451,35 @@ struct AgentRuntime::Impl {
         continue;
       }
 
-      const auto decision = controller.request_mode(request->name);
-      if (!decision.accepted) {
-        send_error(request->sequence, decision.error, decision.reason);
+      const auto status = controller.status();
+      if (!status.sdk_linked || !status.control_authority ||
+          status.error_code != 0U ||
+          (controller.emergency_stop_latched() &&
+           request->mode != kAstrallModeDamping)) {
+        controller.complete_mode_transition(false);
+        send_error(request->sequence, BridgeError::NoControlAuthority,
+                   "mode transition lost its safety prerequisites");
         continue;
       }
 
+      std::uint16_t zero_result{};
       std::uint16_t result{};
       {
         std::lock_guard<std::mutex> lock(sdk_mutex);
-        result = sdk.set_mode(request->mode, config.sdk_call_timeout_ms);
+        zero_result = sdk.move(0, 0, 0, config.sdk_call_timeout_ms);
+        if (zero_result == kAstrallSuccess) {
+          result = sdk.set_mode(request->mode, config.sdk_call_timeout_ms);
+        }
+      }
+      if (zero_result != kAstrallSuccess) {
+        controller.complete_mode_transition(false);
+        send_error(request->sequence, BridgeError::SdkCallFailed,
+                   "zero velocity before mode transition failed: " +
+                       std::to_string(zero_result));
+        continue;
       }
       if (result != kAstrallSuccess) {
+        controller.complete_mode_transition(false);
         send_error(request->sequence, BridgeError::SdkCallFailed,
                    "AstrallSportModeControl failed: " +
                        std::to_string(result));
@@ -458,13 +492,23 @@ struct AgentRuntime::Impl {
       while (!stop.load() && std::chrono::steady_clock::now() < deadline) {
         if (controller.emergency_stop_latched() &&
             request->mode != kAstrallModeDamping) {
+          controller.complete_mode_transition(false);
           send_error(request->sequence, BridgeError::EmergencyStopLatched,
                      "mode transition interrupted by emergency stop");
           completed = true;
           break;
         }
         const auto snapshot = refresh_snapshot(false);
+        if (!snapshot.sdk_linked || !snapshot.control_authority ||
+            snapshot.error_code != 0U) {
+          controller.complete_mode_transition(false);
+          send_error(request->sequence, BridgeError::NoControlAuthority,
+                     "mode transition lost SDK link, authority, or health");
+          completed = true;
+          break;
+        }
         if (snapshot.sport_status == request->expected_status) {
+          controller.complete_mode_transition(true);
           send_ack(request->sequence, result,
                    "mode reached stable ASTRALL sport state");
           completed = true;
@@ -473,6 +517,7 @@ struct AgentRuntime::Impl {
         std::this_thread::sleep_for(config.mode_poll_period);
       }
       if (!completed && !stop.load()) {
+        controller.complete_mode_transition(false);
         send_error(request->sequence, BridgeError::Timeout,
                    "timed out waiting for ASTRALL sport state " +
                        std::to_string(request->expected_status));
@@ -486,6 +531,7 @@ struct AgentRuntime::Impl {
       if (!datagram) {
         continue;
       }
+      if (!negotiated(CapabilityOdometry)) continue;
       const auto parsed = parse_odometry_packet(
           datagram->bytes, config.lidar_packing,
           config.odometry_position_scale, config.odometry_quaternion_scale);
@@ -505,6 +551,7 @@ struct AgentRuntime::Impl {
   void lidar_loop() {
     while (!stop.load() && udp.lidar != nullptr) {
       const auto datagram = udp.lidar->receive(std::chrono::milliseconds(50));
+      if (!handshake_complete.load()) continue;
       if (datagram && !parse_point_cloud_packet(
                           datagram->bytes, config.lidar_packing,
                           config.point_coordinate_scale)) {
@@ -520,6 +567,7 @@ struct AgentRuntime::Impl {
       if (!datagram) {
         continue;
       }
+      if (!negotiated(CapabilityCamera)) continue;
       // TODO:参考手册第24页补充实现：实机确认UDP 6000 H.264分片及关键帧边界。
       CameraChunkPayload payload;
       payload.stream_id = 0;
@@ -595,7 +643,7 @@ AgentRuntime::~AgentRuntime() {
   impl_->safe_shutdown();
 }
 
-int AgentRuntime::run() {
+int AgentRuntime::run(std::function<bool()> external_stop_requested) {
   if (!impl_->initialize()) {
     impl_->stream.close();
     return 2;
@@ -621,11 +669,15 @@ int AgentRuntime::run() {
 
   try {
     while (!impl_->stop.load()) {
-      const auto bytes = impl_->stream.read_some();
-      if (bytes.empty()) {
+      if (external_stop_requested && external_stop_requested()) {
+        impl_->stop.store(true);
         break;
       }
-      for (auto& frame : impl_->decoder.feed(bytes)) {
+      const auto bytes =
+          impl_->stream.read_some(std::chrono::milliseconds(50));
+      if (!bytes) break;
+      if (bytes->empty()) continue;
+      for (auto& frame : impl_->decoder.feed(*bytes)) {
         impl_->process(std::move(frame));
       }
     }

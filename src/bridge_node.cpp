@@ -62,6 +62,11 @@ struct HypertronBridgeNode::Impl {
       : node(node_value), backend(), sleeper(), clock() {
     const auto ssh_config = read_ssh_config();
     const auto receiver_config = read_receiver_config();
+    requested_capabilities = CapabilityImu | CapabilitySport |
+                             CapabilityOdometry | CapabilitySystemState;
+    if (receiver_config.camera_enabled) {
+      requested_capabilities |= CapabilityCamera;
+    }
     const auto deadman_ms = node.declare_parameter<int>(
         "safety.command_deadman_ms", 100);
     mode_timeout = std::chrono::milliseconds(
@@ -150,6 +155,7 @@ struct HypertronBridgeNode::Impl {
   std::mutex mode_mutex;
   std::optional<PendingMode> pending_mode;
   std::uint32_t hello_nonce{};
+  std::uint32_t requested_capabilities{};
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_commands;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_mode;
@@ -264,6 +270,10 @@ struct HypertronBridgeNode::Impl {
   }
 
   void on_velocity(const geometry_msgs::msg::Twist& message) {
+    if (!agent_ready()) {
+      update_error("/cmd_vel rejected until HELLO_ACK negotiation completes");
+      return;
+    }
     const auto decision = controller->accept_velocity(
         {static_cast<float>(message.linear.x),
          static_cast<float>(message.linear.y),
@@ -297,6 +307,10 @@ struct HypertronBridgeNode::Impl {
   }
 
   void on_mode(const std::string& name) {
+    if (!agent_ready()) {
+      update_error("/robot_mode rejected until HELLO_ACK negotiation completes");
+      return;
+    }
     const auto decision = controller->request_mode(name);
     if (!decision.accepted) {
       update_error(decision.reason);
@@ -327,13 +341,17 @@ struct HypertronBridgeNode::Impl {
         std::lock_guard<std::mutex> lock(mode_mutex);
         pending_mode.reset();
       }
+      controller->complete_mode_transition(false);
       update_error("robot mode dropped because SSH agent is disconnected");
     }
   }
 
   void on_emergency_stop(bool engage,
                          std_srvs::srv::SetBool::Response& response) {
-    if (engage) controller->trigger_estop();
+    if (engage) {
+      controller->trigger_estop();
+      publish_connection_state();
+    }
     auto promise = std::make_shared<std::promise<RequestResult>>();
     auto future = promise->get_future();
     auto frame = command_frame(MessageType::CmdEstop, encode_estop({engage}));
@@ -343,8 +361,18 @@ struct HypertronBridgeNode::Impl {
       pending.emplace(frame.sequence, promise);
     }
     if (!tunnel->send(std::move(frame))) {
-      std::lock_guard<std::mutex> lock(pending_mutex);
-      pending.erase(request_sequence);
+      {
+        std::lock_guard<std::mutex> lock(pending_mutex);
+        pending.erase(request_sequence);
+      }
+      {
+        std::lock_guard<std::mutex> lock(state_mutex);
+        connection.ssh_connected = false;
+        connection.agent_connected = false;
+        connection.last_error = "emergency-stop send failed: SSH disconnected";
+      }
+      controller->set_negotiated_ready(false);
+      publish_connection_state();
       response.success = false;
       response.message = "SSH agent is disconnected";
       return;
@@ -372,21 +400,13 @@ struct HypertronBridgeNode::Impl {
     try {
       if (frame.type == MessageType::HelloAck) {
         const auto hello = decode_hello_ack(frame.payload);
-        if (hello.selected_version != kBridgeProtocolVersion) {
-          throw ProtocolError("agent selected an incompatible HTBR version");
-        }
-        if (hello.instance_nonce != hello_nonce) {
-          throw ProtocolError("agent HELLO_ACK nonce does not match this session");
-        }
-        if ((hello.capabilities & CapabilityJoint) != 0U) {
-          throw ProtocolError(
-              "agent advertised unsupported JOINT capability semantics");
-        }
+        validate_hello_ack(hello, hello_nonce, requested_capabilities);
         {
           std::lock_guard<std::mutex> lock(state_mutex);
           connection.agent_connected = true;
           connection.last_error.clear();
         }
+        controller->set_negotiated_ready(true);
         publish_connection_state();
         RCLCPP_INFO(node.get_logger(), "Hypertron agent ready; SDK %s",
                     hello.sdk_version.c_str());
@@ -413,6 +433,9 @@ struct HypertronBridgeNode::Impl {
         tunnel->send(command_frame(MessageType::Pong, {}));
         return;
       }
+      if (!agent_ready()) {
+        throw ProtocolError("agent telemetry arrived before valid HELLO_ACK");
+      }
       if (frame.type == MessageType::RobotState) {
         const auto state = decode_robot_state(frame.payload);
         controller->update_robot_state(
@@ -426,8 +449,14 @@ struct HypertronBridgeNode::Impl {
         std::lock_guard<std::mutex> lock(state_mutex);
         ++connection.protocol_rx_drops;
         connection.last_error = error.what();
+        connection.agent_connected = false;
       }
+      controller->set_negotiated_ready(false);
+      controller->update_robot_state({});
+      fail_mode(error.what());
+      fail_pending(error.what());
       publish_connection_state();
+      throw;
     }
   }
 
@@ -440,13 +469,12 @@ struct HypertronBridgeNode::Impl {
         connection.last_error.clear();
       }
       publish_connection_state();
+      controller->set_negotiated_ready(false);
+      controller->update_robot_state({});
       hello_nonce = static_cast<std::uint32_t>(steady_now_ns()) ^
                     next_sequence.load() ^ 0x48544252U;
       const HelloPayload hello{kBridgeProtocolVersion, kBridgeProtocolVersion,
-                               CapabilityImu | CapabilitySport |
-                                   CapabilityOdometry | CapabilitySystemState |
-                                   CapabilityCamera,
-                                hello_nonce};
+                               requested_capabilities, hello_nonce};
       tunnel->send(command_frame(MessageType::Hello, encode_hello(hello)));
       return;
     }
@@ -459,6 +487,7 @@ struct HypertronBridgeNode::Impl {
         connection.protocol_rx_drops = tunnel->protocol_drops();
         connection.last_error = detail;
       }
+      controller->set_negotiated_ready(false);
       controller->update_robot_state({});
       fail_mode(detail);
       fail_pending(detail);
@@ -501,9 +530,11 @@ struct HypertronBridgeNode::Impl {
       pending_mode.reset();
     }
     if (success) {
+      controller->complete_mode_transition(true);
       RCLCPP_INFO(node.get_logger(), "Robot mode '%s' confirmed: %s",
                   name.c_str(), detail.c_str());
     } else {
+      controller->complete_mode_transition(false);
       update_error("robot mode '" + name + "' failed: " + detail);
     }
     return true;
@@ -518,6 +549,7 @@ struct HypertronBridgeNode::Impl {
       pending_mode.reset();
     }
     update_error("robot mode '" + name + "' failed: " + reason);
+    controller->complete_mode_transition(false);
   }
 
   void check_mode_timeout() {
@@ -533,6 +565,7 @@ struct HypertronBridgeNode::Impl {
     }
     update_error("robot mode '" + name +
                  "' timed out waiting for stable-state ACK");
+    controller->complete_mode_transition(false);
   }
 
   void update_error(const std::string& error) {
@@ -549,8 +582,14 @@ struct HypertronBridgeNode::Impl {
       std::lock_guard<std::mutex> lock(state_mutex);
       copy = connection;
     }
+    copy.emergency_stop_latched = controller->emergency_stop_latched();
     receiver->set_connection_state(copy);
     if (!copy.agent_connected) receiver->publish_disconnected_state();
+  }
+
+  bool agent_ready() {
+    std::lock_guard<std::mutex> lock(state_mutex);
+    return connection.agent_connected;
   }
 };
 
