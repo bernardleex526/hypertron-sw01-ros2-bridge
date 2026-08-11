@@ -17,6 +17,15 @@ target_include_directories(hypertron_protocol INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
+if(BUILD_TESTING)
+  find_package(GTest REQUIRED)
+
+  add_executable(test_thread_safe_queue test/test_thread_safe_queue.cpp)
+  target_link_libraries(test_thread_safe_queue PRIVATE
+    hypertron_protocol GTest::gtest_main Threads::Threads)
+  add_test(NAME thread_safe_queue COMMAND test_thread_safe_queue)
+endif()
+
 if(BUILD_ROS2_BRIDGE)
   find_package(ament_cmake REQUIRED)
   find_package(geometry_msgs REQUIRED)
