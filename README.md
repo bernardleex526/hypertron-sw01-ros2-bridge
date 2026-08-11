@@ -141,27 +141,36 @@ camera:
 
 ## SOP 5：启动、状态门禁与首次低速运动
 
-启动 PC 节点并检查 ROS 图和状态：
+启动和检查需要使用独立终端；不要把前台 bridge、持续 `ros2 topic echo` 与后续命令放在同一串命令中。
+
+**终端 A（保持运行）：**
 
 ```bash
 source /opt/ros/humble/setup.bash
 source <HYPERTRON_WS>/install/setup.bash
 ros2 run hypertron_ros2_bridge hypertron_bridge_node --ros-args \
   --params-file <HYPERTRON_WS>/src/hypertron_ros2_bridge/config/bridge_config.yaml
+```
+
+**终端 B（在终端 A 启动后执行）：**
+
+```bash
+source /opt/ros/humble/setup.bash
+source <HYPERTRON_WS>/install/setup.bash
 ros2 topic list
-ros2 topic echo /robot_state
 ros2 service list
+ros2 topic echo --once /robot_state
 ```
 
 运动前，`/robot_state` 必须同时满足：`ssh_connected == true`、`agent_connected == true`、`sdk_linked == true`、`control_authority == true`、`error_code == 0`、`sport_status == 0xB104`，且 `emergency_stop == false`。任一项不满足时不得发送非零 `/cmd_vel`。
 
-在支撑状态下，先站立、确认、进入 move，再以 20 Hz 发送低速命令；停止时明确发送零速：
+在支撑状态下，先站立并观察 `sport_status == 0xB102`，再进入 move 并观察 `sport_status == 0xB104`，两项确认后才可以 20 Hz 发送低速命令；停止时明确发送零速。以下均在终端 B 执行，`--once` 只读取一条状态，必要时重复执行直到达到预期状态：
 
 ```bash
 ros2 topic pub --once /robot_mode std_msgs/msg/String "{data: stand}"
-ros2 topic echo /robot_state
+ros2 topic echo --once /robot_state
 ros2 topic pub --once /robot_mode std_msgs/msg/String "{data: move}"
-ros2 topic echo /robot_state
+ros2 topic echo --once /robot_state
 ros2 topic pub --rate 20 /cmd_vel geometry_msgs/msg/Twist \
   "{linear: {x: 0.10, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}"
 ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist \
@@ -176,7 +185,7 @@ ros2 service call /emergency_stop std_srvs/srv/SetBool "{data: true}"
 每次故障都先停止运动、保持支撑与实体安全链路，再按以下决策恢复：
 
 1. SSH 丢失：确认零速和阻尼，PC 清空旧速度/模式；核对网络与主机指纹，重连后重新完成 HELLO、模式选择和新速度命令，绝不回放旧命令。
-2. 心跳超时：约 500 ms 后 SDK 指令清空并锁定站立；继续失联会清空连接和控制权。排除链路问题后从状态门禁重新开始。
+2. 心跳超时：约 500 ms 后 agent 明确调用 `AstrallMove(0, 0, 0)` 并请求 `kAstrallModeDamping`（`0xA101`）；确认 `sport_status == 0xB101`，而不是“锁定站立”。继续失联会清空连接和控制权。排除链路问题后从状态门禁重新开始。
 3. 控制权丢失：停止发送运动；由现场确认遥控器/其他控制器已释放后，再申请控制权。agent 不循环抢权。
 4. 模式超时：查看 `error_code`、实际 `sport_status` 和相关 ERROR；不要并发重发模式。故障排除后从 `stand` 重新串行执行。
 5. 未验证里程计：`odometry_scale_verified=false` 时只作诊断观察，不用于定位、闭环控制或安全判断；抓包/标定后才可更改配置。
