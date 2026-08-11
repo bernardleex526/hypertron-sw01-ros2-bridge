@@ -156,6 +156,35 @@ std::uint64_t read_u64_be(const std::uint8_t* p) {
   return value;
 }
 
+std::uint16_t read_u16_le(const std::uint8_t* p) {
+  return static_cast<std::uint16_t>(
+      p[0] | (static_cast<std::uint16_t>(p[1]) << 8U));
+}
+
+std::uint32_t read_u32_le(const std::uint8_t* p) {
+  std::uint32_t value{};
+  for (int i = 3; i >= 0; --i) {
+    value = (value << 8U) | p[i];
+  }
+  return value;
+}
+
+std::uint64_t read_u64_le(const std::uint8_t* p) {
+  std::uint64_t value{};
+  for (int i = 7; i >= 0; --i) {
+    value = (value << 8U) | p[i];
+  }
+  return value;
+}
+
+std::int64_t read_i64_le(const std::uint8_t* p) {
+  return static_cast<std::int64_t>(read_u64_le(p));
+}
+
+std::int32_t read_i32_le(const std::uint8_t* p) {
+  return static_cast<std::int32_t>(read_u32_le(p));
+}
+
 void write_u32_be(std::uint8_t* p, std::uint32_t value) {
   p[0] = static_cast<std::uint8_t>(value >> 24U);
   p[1] = static_cast<std::uint8_t>(value >> 16U);
@@ -643,6 +672,149 @@ CameraChunkPayload decode_camera_chunk(const std::vector<std::uint8_t>& bytes) {
   p.data = r.rest();
   r.finish();
   return p;
+}
+
+std::optional<OdometryPacket> parse_odometry_packet(
+    const std::vector<std::uint8_t>& datagram, PackingMode packing,
+    double position_scale, double quaternion_scale) {
+  if (!std::isfinite(position_scale) || position_scale <= 0.0 ||
+      !std::isfinite(quaternion_scale) || quaternion_scale <= 0.0) {
+    return std::nullopt;
+  }
+
+  const auto parse_layout = [&](bool aligned) -> std::optional<OdometryPacket> {
+    // TODO:参考手册第26页补充实现：确认UDP 6101里程计的packing和字节序。
+    const std::size_t time_offset = aligned ? 8U : 2U;
+    const std::size_t position_offset = aligned ? 16U : 10U;
+    const std::size_t quaternion_offset = aligned ? 40U : 34U;
+    const std::size_t tail_offset = aligned ? 72U : 66U;
+    const std::size_t expected_size = aligned ? 80U : 68U;
+    if (datagram.size() != expected_size ||
+        read_u16_le(datagram.data()) != 0xAA55U ||
+        read_u16_le(datagram.data() + tail_offset) != 0xFF00U) {
+      return std::nullopt;
+    }
+
+    OdometryPacket packet;
+    packet.device_time = read_u64_le(datagram.data() + time_offset);
+    // TODO:参考手册第26页补充实现：用实机数据标定位置与四元数比例。
+    for (std::size_t i = 0; i < packet.position.size(); ++i) {
+      packet.position[i] = static_cast<double>(read_i64_le(
+                               datagram.data() + position_offset + 8U * i)) *
+                           position_scale;
+      if (!std::isfinite(packet.position[i])) {
+        return std::nullopt;
+      }
+    }
+    double norm_squared = 0.0;
+    for (std::size_t i = 0; i < packet.orientation.size(); ++i) {
+      packet.orientation[i] =
+          static_cast<double>(read_i64_le(
+              datagram.data() + quaternion_offset + 8U * i)) *
+          quaternion_scale;
+      norm_squared += packet.orientation[i] * packet.orientation[i];
+    }
+    if (!std::isfinite(norm_squared) || norm_squared <= 1e-24) {
+      return std::nullopt;
+    }
+    const auto norm = std::sqrt(norm_squared);
+    for (auto& component : packet.orientation) {
+      component /= norm;
+    }
+    return packet;
+  };
+
+  if (packing == PackingMode::Packed) {
+    return parse_layout(false);
+  }
+  if (packing == PackingMode::NaturalAligned) {
+    return parse_layout(true);
+  }
+  if (auto packed = parse_layout(false)) {
+    return packed;
+  }
+  return parse_layout(true);
+}
+
+std::optional<PointCloudPacket> parse_point_cloud_packet(
+    const std::vector<std::uint8_t>& datagram, PackingMode packing,
+    double coordinate_scale) {
+  if (!std::isfinite(coordinate_scale) || coordinate_scale <= 0.0) {
+    return std::nullopt;
+  }
+
+  const auto parse_layout = [&](bool aligned)
+      -> std::optional<PointCloudPacket> {
+    // TODO:参考手册第24页补充实现：确认UDP 6100点云的packing和字节序。
+    const std::size_t time_offset = aligned ? 8U : 2U;
+    const std::size_t frame_offset = aligned ? 16U : 10U;
+    const std::size_t data_offset = aligned ? 20U : 14U;
+    const std::size_t count_offset = aligned ? 24U : 18U;
+    const std::size_t points_offset = aligned ? 28U : 20U;
+    if (datagram.size() < points_offset + 2U ||
+        read_u16_le(datagram.data()) != 0xAA55U) {
+      return std::nullopt;
+    }
+    const auto count = read_u16_le(datagram.data() + count_offset);
+    if (count > 50U) {
+      return std::nullopt;
+    }
+    constexpr std::size_t kPointSize = 28U;
+    const auto dynamic_tail = points_offset + kPointSize * count;
+    const auto fixed_tail = points_offset + kPointSize * 50U;
+    std::size_t tail_offset{};
+    const auto tail_matches = [&](std::size_t offset) {
+      return offset + 2U <= datagram.size() &&
+             read_u16_le(datagram.data() + offset) == 0xFF00U;
+    };
+    if (tail_matches(dynamic_tail) &&
+        (datagram.size() == dynamic_tail + 2U ||
+         (aligned && datagram.size() <= dynamic_tail + 8U))) {
+      tail_offset = dynamic_tail;
+    } else if (tail_matches(fixed_tail) &&
+               (datagram.size() == fixed_tail + 2U ||
+                (aligned && datagram.size() <= fixed_tail + 8U))) {
+      tail_offset = fixed_tail;
+    } else {
+      return std::nullopt;
+    }
+    (void)tail_offset;
+
+    PointCloudPacket packet;
+    packet.device_time = read_u64_le(datagram.data() + time_offset);
+    packet.frame_index = read_u32_le(datagram.data() + frame_offset);
+    packet.data_index = read_u32_le(datagram.data() + data_offset);
+    packet.points.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      const auto* point = datagram.data() + points_offset + i * kPointSize;
+      LidarPoint decoded;
+      decoded.x = static_cast<double>(read_i32_le(point)) * coordinate_scale;
+      decoded.y =
+          static_cast<double>(read_i32_le(point + 4U)) * coordinate_scale;
+      decoded.z =
+          static_cast<double>(read_i32_le(point + 8U)) * coordinate_scale;
+      for (std::size_t channel = 0; channel < decoded.rgba.size(); ++channel) {
+        decoded.rgba[channel] = read_u32_le(point + 12U + channel * 4U);
+      }
+      if (!std::isfinite(decoded.x) || !std::isfinite(decoded.y) ||
+          !std::isfinite(decoded.z)) {
+        return std::nullopt;
+      }
+      packet.points.push_back(decoded);
+    }
+    return packet;
+  };
+
+  if (packing == PackingMode::Packed) {
+    return parse_layout(false);
+  }
+  if (packing == PackingMode::NaturalAligned) {
+    return parse_layout(true);
+  }
+  if (auto packed = parse_layout(false)) {
+    return packed;
+  }
+  return parse_layout(true);
 }
 
 }  // namespace hypertron_ros2_bridge

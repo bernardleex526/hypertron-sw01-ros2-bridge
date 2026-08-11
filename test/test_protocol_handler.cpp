@@ -1,5 +1,8 @@
 #include <array>
+#include <cmath>
 #include <cstdint>
+#include <cstring>
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -11,6 +14,77 @@ namespace {
 
 Frame ping(std::uint32_t sequence) {
   return {MessageType::Ping, sequence, 1000U + sequence, {}};
+}
+
+void put_u16_le(std::vector<std::uint8_t>& bytes, std::size_t offset,
+                std::uint16_t value) {
+  bytes[offset] = static_cast<std::uint8_t>(value);
+  bytes[offset + 1] = static_cast<std::uint8_t>(value >> 8U);
+}
+
+void put_u32_le(std::vector<std::uint8_t>& bytes, std::size_t offset,
+                std::uint32_t value) {
+  for (std::size_t i = 0; i < 4; ++i) {
+    bytes[offset + i] = static_cast<std::uint8_t>(value >> (i * 8U));
+  }
+}
+
+void put_i64_le(std::vector<std::uint8_t>& bytes, std::size_t offset,
+                std::int64_t value) {
+  const auto bits = static_cast<std::uint64_t>(value);
+  for (std::size_t i = 0; i < 8; ++i) {
+    bytes[offset + i] = static_cast<std::uint8_t>(bits >> (i * 8U));
+  }
+}
+
+std::vector<std::uint8_t> packed_odometry_fixture() {
+  std::vector<std::uint8_t> bytes(68, 0);
+  put_u16_le(bytes, 0, 0xAA55U);
+  put_i64_le(bytes, 2, 99);
+  put_i64_le(bytes, 10, 1000000);
+  put_i64_le(bytes, 18, -2000000);
+  put_i64_le(bytes, 26, 500000);
+  put_i64_le(bytes, 34, 0);
+  put_i64_le(bytes, 42, 0);
+  put_i64_le(bytes, 50, 0);
+  put_i64_le(bytes, 58, 1000000);
+  put_u16_le(bytes, 66, 0xFF00U);
+  return bytes;
+}
+
+std::vector<std::uint8_t> aligned_odometry_fixture() {
+  std::vector<std::uint8_t> bytes(80, 0);
+  put_u16_le(bytes, 0, 0xAA55U);
+  put_i64_le(bytes, 8, 100);
+  put_i64_le(bytes, 16, 1);
+  put_i64_le(bytes, 24, 2);
+  put_i64_le(bytes, 32, 3);
+  put_i64_le(bytes, 40, 0);
+  put_i64_le(bytes, 48, 0);
+  put_i64_le(bytes, 56, 0);
+  put_i64_le(bytes, 64, 1);
+  put_u16_le(bytes, 72, 0xFF00U);
+  return bytes;
+}
+
+std::vector<std::uint8_t> point_cloud_fixture(std::uint16_t count) {
+  std::vector<std::uint8_t> bytes(20U + 28U * count + 2U, 0);
+  put_u16_le(bytes, 0, 0xAA55U);
+  put_i64_le(bytes, 2, 200);
+  put_u32_le(bytes, 10, 7);
+  put_u32_le(bytes, 14, 8);
+  put_u16_le(bytes, 18, count);
+  if (count > 0U) {
+    put_u32_le(bytes, 20, static_cast<std::uint32_t>(1000));
+    put_u32_le(bytes, 24, static_cast<std::uint32_t>(-2000));
+    put_u32_le(bytes, 28, static_cast<std::uint32_t>(500));
+    put_u32_le(bytes, 32, 0x11223344U);
+    put_u32_le(bytes, 36, 0x55667788U);
+    put_u32_le(bytes, 40, 0x99AABBCCU);
+    put_u32_le(bytes, 44, 0xDDEEFF00U);
+  }
+  put_u16_le(bytes, bytes.size() - 2U, 0xFF00U);
+  return bytes;
 }
 
 TEST(ProtocolHandler, RoundTripsNetworkOrderFrame) {
@@ -128,6 +202,46 @@ TEST(PayloadCodec, RejectsMalformedAndNonFinitePayloads) {
   auto hello = encode_hello({1, 1, 0, 1});
   hello[2] = 1;
   EXPECT_THROW(decode_hello(hello), ProtocolError);
+}
+
+TEST(Sw01Udp, ParsesPackedOdometryAndNormalizesQuaternion) {
+  const auto odom = parse_odometry_packet(
+      packed_odometry_fixture(), PackingMode::Auto, 1e-6, 1e-6);
+  ASSERT_TRUE(odom.has_value());
+  EXPECT_DOUBLE_EQ(odom->position[0], 1.0);
+  EXPECT_DOUBLE_EQ(odom->position[1], -2.0);
+  EXPECT_DOUBLE_EQ(odom->position[2], 0.5);
+  EXPECT_DOUBLE_EQ(odom->orientation[3], 1.0);
+}
+
+TEST(Sw01Udp, AcceptsNaturalAlignmentAndRejectsBadTail) {
+  auto bytes = aligned_odometry_fixture();
+  EXPECT_TRUE(parse_odometry_packet(bytes, PackingMode::Auto, 1.0, 1.0));
+  bytes[73] = 0;
+  EXPECT_FALSE(parse_odometry_packet(bytes, PackingMode::Auto, 1.0, 1.0));
+}
+
+TEST(Sw01Udp, RejectsInvalidScaleAndZeroQuaternion) {
+  auto bytes = packed_odometry_fixture();
+  EXPECT_FALSE(parse_odometry_packet(bytes, PackingMode::Auto, 0.0, 1e-6));
+  for (std::size_t offset = 34; offset < 66; ++offset) {
+    bytes[offset] = 0;
+  }
+  EXPECT_FALSE(parse_odometry_packet(bytes, PackingMode::Auto, 1e-6, 1e-6));
+}
+
+TEST(Sw01Udp, ParsesPointCloudAndRejectsCountAboveFifty) {
+  const auto cloud =
+      parse_point_cloud_packet(point_cloud_fixture(1), PackingMode::Auto, 1e-3);
+  ASSERT_TRUE(cloud.has_value());
+  ASSERT_EQ(cloud->points.size(), 1U);
+  EXPECT_DOUBLE_EQ(cloud->points[0].x, 1.0);
+  EXPECT_DOUBLE_EQ(cloud->points[0].y, -2.0);
+  EXPECT_EQ(cloud->points[0].rgba[0], 0x11223344U);
+
+  const auto oversized = point_cloud_fixture(51);
+  EXPECT_FALSE(
+      parse_point_cloud_packet(oversized, PackingMode::Auto, 1e-3));
 }
 
 }  // namespace

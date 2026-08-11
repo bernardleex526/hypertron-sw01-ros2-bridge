@@ -3,6 +3,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -210,5 +211,34 @@ RobotStatePayload decode_robot_state(const std::vector<std::uint8_t>& bytes);
 std::vector<std::uint8_t> encode_camera_chunk(
     const CameraChunkPayload& payload);
 CameraChunkPayload decode_camera_chunk(const std::vector<std::uint8_t>& bytes);
+
+enum class PackingMode { Auto, Packed, NaturalAligned };
+
+struct LidarPoint {
+  double x{};
+  double y{};
+  double z{};
+  std::array<std::uint32_t, 4> rgba{};
+};
+
+struct PointCloudPacket {
+  std::uint64_t device_time{};
+  std::uint32_t frame_index{};
+  std::uint32_t data_index{};
+  std::vector<LidarPoint> points;
+};
+
+struct OdometryPacket {
+  std::uint64_t device_time{};
+  std::array<double, 3> position{};
+  std::array<double, 4> orientation{};
+};
+
+std::optional<PointCloudPacket> parse_point_cloud_packet(
+    const std::vector<std::uint8_t>& datagram, PackingMode packing,
+    double coordinate_scale);
+std::optional<OdometryPacket> parse_odometry_packet(
+    const std::vector<std::uint8_t>& datagram, PackingMode packing,
+    double position_scale, double quaternion_scale);
 
 }  // namespace hypertron_ros2_bridge
