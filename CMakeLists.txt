@@ -28,6 +28,13 @@ target_include_directories(hypertron_agent_core PUBLIC
 target_link_libraries(hypertron_agent_core PUBLIC
   hypertron_protocol Threads::Threads)
 
+add_library(hypertron_ssh STATIC src/ssh_tunnel.cpp)
+target_include_directories(hypertron_ssh PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:include>)
+target_link_libraries(hypertron_ssh PUBLIC
+  hypertron_protocol Threads::Threads)
+
 if(BUILD_TESTING)
   find_package(GTest REQUIRED)
 
@@ -50,9 +57,16 @@ if(BUILD_TESTING)
   target_link_libraries(test_agent_runtime PRIVATE
     hypertron_agent_core GTest::gtest_main Threads::Threads)
   add_test(NAME agent_runtime COMMAND test_agent_runtime)
+
+  add_executable(test_ssh_tunnel test/test_ssh_tunnel.cpp)
+  target_link_libraries(test_ssh_tunnel PRIVATE
+    hypertron_ssh GTest::gtest_main Threads::Threads)
+  add_test(NAME ssh_tunnel COMMAND test_ssh_tunnel)
 endif()
 
 if(BUILD_ROS2_BRIDGE)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(LIBSSH REQUIRED IMPORTED_TARGET libssh)
   find_package(ament_cmake REQUIRED)
   find_package(geometry_msgs REQUIRED)
   find_package(nav_msgs REQUIRED)
@@ -61,6 +75,9 @@ if(BUILD_ROS2_BRIDGE)
   find_package(sensor_msgs REQUIRED)
   find_package(std_msgs REQUIRED)
   find_package(std_srvs REQUIRED)
+
+  target_compile_definitions(hypertron_ssh PRIVATE HYPERTRON_WITH_LIBSSH=1)
+  target_link_libraries(hypertron_ssh PRIVATE PkgConfig::LIBSSH)
 
   rosidl_generate_interfaces(${PROJECT_NAME}
     "msg/RobotState.msg"
