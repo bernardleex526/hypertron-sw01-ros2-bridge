@@ -371,8 +371,39 @@ struct AgentRuntime::Impl {
           send_error(frame.sequence, BridgeError::SdkCallFailed,
                      "emergency stop SDK call failed");
         } else {
-          send_ack(frame.sequence, kAstrallSuccess,
-                   "software emergency stop latched and damping requested");
+          // 轮询等待机器人实际进入阻尼稳态（sport_status == 0xB101U）。
+          // 使用专用短超时（mode_timeout/5，≤500ms）以免阻塞 process() 读循环过久。
+          using namespace std::chrono_literals;
+          // estop 确认轮询使用专用短超时（mode_timeout/5，上限500ms）：
+          // process() 是同步调用，长时间阻塞会导致 ping 无法处理、application_expired() 误触。
+          const auto estop_confirm_timeout =
+              std::min(config.mode_timeout / 5,
+                       std::chrono::duration_cast<decltype(config.mode_timeout)>(500ms));
+          const auto estop_deadline =
+              std::chrono::steady_clock::now() + estop_confirm_timeout;
+          bool damping_confirmed = false;
+          while (std::chrono::steady_clock::now() < estop_deadline &&
+                 !stop.load()) {
+            const auto snap = refresh_snapshot(false);
+            // 阻尼稳态的 sport_status 为 0xB101U（见 CmdMode 分支中
+            // 0xA101U -> expected_status 0xB101U 的映射）；kAstrallModeDamping
+            // (0xA101U) 是模式命令码，不能直接用于状态比较。
+            if (snap.sport_status == 0xB101U) {
+              damping_confirmed = true;
+              break;
+            }
+            std::this_thread::sleep_for(config.mode_poll_period);
+          }
+          if (damping_confirmed) {
+            send_ack(frame.sequence, kAstrallSuccess,
+                     "software emergency stop latched; damping state confirmed");
+          } else {
+            // 请求已被 SDK 接受，但在超时内未观测到阻尼稳态；仍 ACK 但注明未确认。
+            send_ack(frame.sequence, kAstrallSuccess,
+                     "software emergency stop latched; damping requested "
+                     "(state confirmation timed out — robot may still be "
+                     "transitioning)");
+          }
         }
       } else {
         controller.clear_estop();
@@ -416,11 +447,17 @@ struct AgentRuntime::Impl {
       if (application_expired()) {
         if (!application_timed_out.exchange(true)) {
           controller.trigger_estop();
-          std::lock_guard<std::mutex> lock(sdk_mutex);
-          sdk.move(0, 0, 0, config.sdk_call_timeout_ms);
-          sdk.set_mode(kAstrallModeDamping, config.sdk_call_timeout_ms);
+          {
+            std::lock_guard<std::mutex> lock(sdk_mutex);
+            sdk.move(0, 0, 0, config.sdk_call_timeout_ms);
+            sdk.set_mode(kAstrallModeDamping, config.sdk_call_timeout_ms);
+          }
           set_last_error(
-              "PC application heartbeat timed out; damping requested");
+              "PC application heartbeat timed out; damping requested; "
+              "agent shutting down");
+          // PC 应用层超时后不应继续维持 SDK 心跳与控制权：
+          // 置 stop=true 触发 run() 清理路径（join 所有线程 → safe_shutdown → deinit）。
+          stop.store(true);
         }
       } else {
         const auto velocity = controller.velocity_for_tick().value;
