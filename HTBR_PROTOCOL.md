@@ -45,6 +45,8 @@ CRC 覆盖“CRC 字段清零后的完整头 + payload”。接收端还检查 m
 - CMD_ESTOP 走最高优先级队列；CMD_VELOCITY 使用 latest-value mailbox，不积压旧速度；其他命令使用有界 FIFO。
 - agent 的控制响应、RobotState、里程计、IMU/运动和相机使用相互独立的有界队列；视频队列只保留最近数据。
 - 模式命令串行执行，只有 `AstrallGetSportStatus` 到达手册对应状态才 ACK；超时或急停返回 ERROR。
+- 急停确认不阻塞 agent 读循环：agent 收到 CMD_ESTOP 后只做有界 SDK 调用（零速 + 阻尼），阻尼稳态确认由独立 worker 轮询（上限 `min(mode_timeout/5, 500 ms)`）；PING/PONG 与后续命令始终可被处理。确认超时仍 ACK 并注明“requested”。
 - SSH 断开时双方清空尚未发送的命令，重连后必须重新 HELLO、选择模式并发送新速度。
-- PC 允许最长 65 秒的 agent/SDK 初始化期；收到第一个 PONG 后切换为默认 500 ms 应用心跳超时。
+- PC 允许最长 65 秒的 agent/SDK 初始化期；收到第一个 PONG 后切换为默认 1500 ms 的 PC 稳态存活超时（≥ 3 个 PING 周期，且大于 agent 的 500 ms 应用心跳安全超时与急停确认轮询时长，保证机器人的安全停止先于 PC 断连判定）。
+- 6100 点云不在 HTBR 内传输：agent 仅本地校验并周期输出 stderr 诊断（计数、有效性），用于实机标定；本协议没有点云消息类型，也不定义大点云传输。
 

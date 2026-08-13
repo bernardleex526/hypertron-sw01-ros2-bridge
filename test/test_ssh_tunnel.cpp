@@ -244,6 +244,22 @@ TEST(SshTunnel, RejectsConfigurationThatDisablesHostKeyChecking) {
   EXPECT_THROW(SshTunnel(insecure, backend, sleeper), std::invalid_argument);
 }
 
+TEST(SshTunnel, RejectsSteadyStateTimeoutWithoutPingMargin) {
+  FakeBackend backend({ConnectResult::Success});
+  FakeSleeper sleeper;
+  // 稳态存活超时相对 ping 周期没有裕量（< 3 个 ping 周期）时必须拒绝配置：
+  // 否则单个 PONG 抖动就会误拆通道，且可能与 agent 侧 500 ms 安全超时同时触发。
+  auto tight = config();
+  tight.ping_interval = 200ms;
+  tight.application_timeout = 500ms;
+  EXPECT_THROW(SshTunnel(tight, backend, sleeper), std::invalid_argument);
+
+  auto adequate = config();
+  adequate.ping_interval = 200ms;
+  adequate.application_timeout = 600ms;  // == 3 个 ping 周期
+  EXPECT_NO_THROW(SshTunnel(adequate, backend, sleeper));
+}
+
 TEST(SshTunnel, DisconnectedCommandsAreDroppedNotReplayed) {
   FakeBackend backend({ConnectResult::Success});
   FakeSleeper sleeper;

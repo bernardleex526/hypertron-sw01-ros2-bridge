@@ -12,11 +12,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <geometry_msgs/msg/twist.hpp>
+#include <rclcpp/executors/single_threaded_executor.hpp>
+#include <rmw/qos_profiles.h>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_srvs/srv/set_bool.hpp>
@@ -74,6 +77,12 @@ struct HypertronBridgeNode::Impl {
     if (mode_timeout.count() <= 0) {
       throw std::invalid_argument("safety.mode_timeout_ms must be positive");
     }
+    estop_ack_timeout = std::chrono::milliseconds(
+        node.declare_parameter<int>("safety.estop_ack_timeout_ms", 2000));
+    if (estop_ack_timeout.count() < 100 || estop_ack_timeout.count() > 60000) {
+      throw std::invalid_argument(
+          "safety.estop_ack_timeout_ms must be in [100, 60000]");
+    }
     controller = std::make_unique<RobotController>(
         ControllerConfig{std::chrono::milliseconds(deadman_ms)}, clock);
     receiver = std::make_unique<DataReceiver>(node, receiver_config);
@@ -103,12 +112,21 @@ struct HypertronBridgeNode::Impl {
         [this](std_msgs::msg::String::ConstSharedPtr message) {
           on_mode(message->data);
         });
+    estop_callback_group = node.create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
     emergency_stop = node.create_service<std_srvs::srv::SetBool>(
         estop_service,
         [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
                std::shared_ptr<std_srvs::srv::SetBool::Response> response) {
           on_emergency_stop(request->data, *response);
-        });
+        },
+        // rclcpp (Humble) 会在服务回调返回后立即发送响应，不支持回调返回后
+        // 再延迟填充响应。因此急停服务挂在独立回调组与专用单线程执行器上，
+        // 回调内最多等待 estop_ack_timeout 的 agent ACK；主执行器负责
+        // /cmd_vel、/robot_mode、deadman/watchdog 定时器，永远不会被占用。
+        // 服务 QoS 固定使用 rmw_qos_profile_services_default（Reliable、
+        // Volatile、KeepLast 深度 10），与 ROS 2 默认服务语义一致。
+        rmw_qos_profile_services_default, estop_callback_group);
     mode_watchdog = node.create_wall_timer(
         std::chrono::milliseconds(100), [this] { check_mode_timeout(); });
 
@@ -125,10 +143,20 @@ struct HypertronBridgeNode::Impl {
             })) {
       throw std::runtime_error("failed to start SSH tunnel worker");
     }
+    // 急停服务使用专用单线程执行器；主执行器（main.cpp）只挂默认回调组，
+    // 避免同一回调组被两个执行器争用。线程必须在构造函数最后启动，以保证
+    // 构造失败时不会留下未 join 的线程。
+    estop_executor.add_callback_group(estop_callback_group,
+                                      node.get_node_base_interface());
+    estop_executor_thread = std::thread([this] { estop_executor.spin(); });
   }
 
   ~Impl() {
+    // 先停执行器（不再接新请求），再停 SSH（on_tunnel_state 会 fail_pending
+    // 唤醒阻塞中的服务回调），随后 join 服务线程，最后兜底 fail_pending。
+    estop_executor.cancel();
     if (tunnel) tunnel->stop();
+    if (estop_executor_thread.joinable()) estop_executor_thread.join();
     fail_pending("bridge node is shutting down");
   }
 
@@ -140,6 +168,7 @@ struct HypertronBridgeNode::Impl {
   std::unique_ptr<DataReceiver> receiver;
   std::unique_ptr<SshTunnel> tunnel;
   std::chrono::milliseconds mode_timeout{10000};
+  std::chrono::milliseconds estop_ack_timeout{2000};
   std::atomic<std::uint32_t> next_sequence{1};
   std::mutex state_mutex;
   ReceiverConnectionState connection;
@@ -159,8 +188,13 @@ struct HypertronBridgeNode::Impl {
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_vel;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_commands;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr robot_mode;
+  rclcpp::CallbackGroup::SharedPtr estop_callback_group;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr emergency_stop;
   rclcpp::TimerBase::SharedPtr mode_watchdog;
+  // 声明顺序即销毁顺序（逆序）：线程先销毁（~Impl 已 join），再执行器，
+  // 最后回调组。
+  rclcpp::executors::SingleThreadedExecutor estop_executor;
+  std::thread estop_executor_thread;
 
   SshConfig read_ssh_config() {
     SshConfig config;
@@ -190,8 +224,11 @@ struct HypertronBridgeNode::Impl {
         node.declare_parameter<int>("ssh.keepalive_interval_ms", 1000));
     config.ping_interval = std::chrono::milliseconds(
         node.declare_parameter<int>("ssh.ping_interval_ms", 200));
+    // PC 侧稳态存活超时（收到首个 PONG 后生效）。默认 1500 ms，SshTunnel 会
+    // 校验其 ≥ 3× ping_interval，且必须大于 agent 侧 safety.application_timeout_ms
+    // （500 ms，安全停止）与急停确认轮询时长，保证机器人的安全停止先于 PC 断连判定。
     config.application_timeout = std::chrono::milliseconds(
-        node.declare_parameter<int>("ssh.application_timeout_ms", 500));
+        node.declare_parameter<int>("ssh.application_timeout_ms", 1500));
     config.agent_startup_timeout = std::chrono::milliseconds(
         node.declare_parameter<int>("ssh.agent_startup_timeout_ms", 65000));
     config.reconnect_initial_delay = std::chrono::milliseconds(
@@ -377,7 +414,7 @@ struct HypertronBridgeNode::Impl {
       response.message = "SSH agent is disconnected";
       return;
     }
-    if (future.wait_for(mode_timeout) != std::future_status::ready) {
+    if (future.wait_for(estop_ack_timeout) != std::future_status::ready) {
       std::lock_guard<std::mutex> lock(pending_mutex);
       for (auto it = pending.begin(); it != pending.end(); ++it) {
         if (it->second == promise) {

@@ -21,11 +21,21 @@
 | P2 | 参数先转无符号后校验，存在负数环绕 | SSH 端口、周期、队列、payload、agent UDP 端口及 u32 字段均先做范围校验 |
 | P2 | IMU 配置错误地控制里程计时间戳 | IMU 与 odometry 使用独立 timestamp source；相机使用 PC 接收时间 |
 | P2 | ROS 命令 QoS 会积压旧命令 | `/cmd_vel` 和 `/joint_commands` 使用 Reliable KeepLast(1)；模式保持 KeepLast(10) 并由 pending gate 串行化 |
-| P2 | SDK 初始化最长 60 秒，但 SSH 500 ms 就判 agent 失活 | 增加 65 秒 agent startup timeout；收到首个 PONG 后才切换到 500 ms steady-state timeout |
+| P2 | SDK 初始化最长 60 秒，但 SSH 500 ms 就判 agent 失活 | 增加 65 秒 agent startup timeout；收到首个 PONG 后才切换到 1500 ms 稳态存活超时 |
+
+## 审计轮修复记录
+
+| 级别 | 发现 | 处理结果 |
+|---|---|---|
+| P1 | agent 急停确认在 `process()` 同步读循环内轮询最长 500 ms，阻塞 PING 处理，与 500 ms 应用心跳安全超时零裕量，PC 侧存活超时也会同时触发 | 急停确认改为独立队列 + worker 状态机：`process()` 只做有界 SDK 调用（零速+阻尼），阻尼稳态轮询移出读循环；PING 始终及时应答，确认超时仍 ACK 并注明未确认 |
+| P1 | PC `/emergency_stop` 服务回调阻塞执行器最长 `mode_timeout`（10 s） | 服务挂到专用 MutuallyExclusive 回调组与独立单线程执行器，ACK 等待上限 `safety.estop_ack_timeout_ms`（默认 2 s）；主执行器只挂默认回调组，不再被占用 |
+| P2 | PC 稳态存活超时 500 ms 与 agent 安全超时 500 ms 相同、相对 200 ms ping 周期无裕量 | 两侧超时拆分：PC `ssh.application_timeout_ms` 默认 1500 ms 且构造时校验 ≥ 3× ping 周期；agent `safety.application_timeout_ms` 保持 500 ms（对齐手册约 500 ms 无心跳锁定站立行为） |
+| P2 | UDP 6100 解析结果静默丢弃，无效数据报覆盖 `last_error` | 改为计数 + 周期 stderr 诊断（明确“仅标定校验、不转发”）；无效数据报不再覆盖 `last_error`；未新增 HTBR 点云协议 |
+| P3 | README/config SSH 示例漂移（示例 IP 与手册默认 `10.18.0.100` 不一致、密码环境变量未指明）；服务 QoS 表述、`/cmd_vel` 归一化与 Nav2 SI 边界、lidar 不转发、与 universal_slam 组合适配未文档化 | 配置与 README 对齐并补充注释；接口表核对服务 QoS 表述（`rmw_qos_profile_services_default`：Reliable、Volatile、深度 10）；新增归一化/不转发与 universal_slam 适配章节 |
 
 ## 验证矩阵
 
-- 纯 C++：6 个 CTest target 全部通过，覆盖队列、CRC/分帧/payload、控制门控、agent 生命周期/模式确认、SSH 重连/抢占/并发停止和数据映射。
+- 纯 C++：6 个 CTest target 全部通过，覆盖队列、CRC/分帧/payload、控制门控、agent 生命周期/模式确认、急停确认非阻塞（PING 在确认轮询期间仍被应答）、确认超时仍 ACK、6100 无效数据报不覆盖 `last_error`、SSH 存活超时 ≥ 3× ping 周期的配置校验、SSH 重连/抢占/并发停止和数据映射。
 - Python 合同：7 个 pytest 全部通过，检查交付结构、ROS 接口声明、camera worker、有效配置、仓库根命令、许可证安装和运维文档。
 - Sanitizer：ASan + UBSan 与 `-Wall -Wextra -Wpedantic -Werror` 运行全部纯测试通过。
 - ROS2：在 Ubuntu 22.04 / ROS2 Humble 上启用 libssh 0.9.6 和 FFmpeg，节点与自定义消息以 warnings-as-errors 完整编译、链接；`ldd` 确认 libssh/libavcodec/libswscale。

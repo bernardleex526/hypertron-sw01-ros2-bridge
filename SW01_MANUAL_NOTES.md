@@ -105,6 +105,8 @@ uint16_t AstrallSendMessage(char* data, uint16_t len);
 
 解析器支持紧凑布局和常见自然对齐布局，并接受动态点数组尾标记或固定 50 点数组尾标记。手册没有规定字节序、packing 与坐标比例；当前默认小端、auto packing、坐标比例 `1e-3`，必须用实机抓包确认。
 
+本工程 agent 只在本地接收并校验 6100 数据报，用于实机抓包标定与计数诊断（周期输出 stderr，无效数据报不覆盖 `last_error`）；点云不通过 HTBR 转发，也不发布任何 ROS 点云话题。需要点云的方案（如 universal_slam / FAST-LIO2）必须另行实现 6100 → PointCloud2 驱动。
+
 ## UDP 6101 里程计
 
 手册第 26 页描述：头、64 位纳秒时间戳、三个 `int64` 位置、四个 `int64` 四元数、尾。实现支持：

@@ -175,7 +175,10 @@ AgentFileSettings load_config(const std::string& path) {
       }
       continue;
     }
-    if (section == "ssh" && key == "application_timeout_ms") {
+    if (section == "safety" && key == "application_timeout_ms") {
+      // agent 侧应用心跳安全超时：约 500 ms 未收到 PC PING/PONG 即零速并请求
+      // damping（对齐手册行为）。与 PC 侧的 ssh.application_timeout_ms
+      // （1500 ms，仅管理 SSH 连接）相互独立。
       settings.agent.application_timeout =
           std::chrono::milliseconds(std::stoll(value));
     } else if (section == "astrall" && key == "sdk_timeout_ms") {

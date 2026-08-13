@@ -22,6 +22,8 @@ HTBR 是 SSH exec channel 上的版本化二进制帧，不是厂家 UDP 3600 �
 ## 功能范围
 
 - 已实现：速度、模式、软件急停、IMU、运动/系统/电池状态、UDP 6101 里程计与可选 UDP 6000 H.264；机器人端采用 `agent-only` 构建。
+- 不转发 LiDAR 点云：UDP 6100 只在 agent 本地接收并校验，用于实机抓包标定与计数诊断（周期写入 stderr），不通过 HTBR 转发、不发布任何 ROS 点云话题。HTBR v1 没有点云消息类型；需要 3D 点云的方案（如 universal_slam / FAST-LIO2）必须另行实现 6100 → `sensor_msgs/msg/PointCloud2` 的驱动。
+- `/cmd_vel` 是归一化无量纲指令：分量限幅到 `[-1, 1]`（ASTRALL `AstrallMove` 语义），不是 SI 单位（m/s、rad/s）。Nav2 等导航栈输出的 SI `Twist` 必须经适配层换算后才能送入本桥，直接接入会量纲错乱。
 - `/joint_commands` 始终安全拒绝且不下行；ASTRALL 1.0.7 没有可用关节 API。`/joint_states` 保持静默，绝不伪造数据。
 - 相机默认关闭。里程计未标定前必须保持 `odometry_scale_verified=false`。
 
@@ -29,9 +31,9 @@ HTBR 是 SSH exec channel 上的版本化二进制帧，不是厂家 UDP 3600 �
 
 | 接口 | 方向 | 类型 | 实际 QoS | 行为 |
 |---|---|---|---|---|
-| `/cmd_vel` | PC -> agent | `geometry_msgs/msg/Twist` | Reliable, Volatile, KeepLast(1) | 使用 `linear.x`、`linear.y`、`angular.z`，限幅到 `[-1, 1]`；100 ms deadman。 |
+| `/cmd_vel` | PC -> agent | `geometry_msgs/msg/Twist` | Reliable, Volatile, KeepLast(1) | 使用 `linear.x`、`linear.y`、`angular.z`，限幅到 `[-1, 1]`（归一化无量纲，非 m/s、rad/s）；100 ms deadman。 |
 | `/robot_mode` | PC -> agent | `std_msgs/msg/String` | Reliable, Volatile, KeepLast(10) | `damping/stand/down/move/auto_charge/exit_charge/recover`（兼容 `recovery`）。 |
-| `/emergency_stop` | PC -> agent | `std_srvs/srv/SetBool` | ROS service default: Reliable, Volatile, KeepLast(10) | `true` 锁存零速并请求阻尼；`false` 只解除软件锁存。 |
+| `/emergency_stop` | PC -> agent | `std_srvs/srv/SetBool` | 服务默认 QoS 配置 `rmw_qos_profile_services_default`（Reliable、Volatile、深度 10；服务请求/响应一一对应，历史深度对服务语义无排队作用） | `true` 锁存零速并请求阻尼；`false` 只解除软件锁存。服务在专用单线程执行器上运行，最多等待 `safety.estop_ack_timeout_ms`（默认 2 s）的 agent ACK，不占用主执行器。 |
 | `/joint_commands` | PC -> local rejection | `sensor_msgs/msg/JointState` | Reliable, Volatile, KeepLast(1) | 明确拒绝，不向机器人发送。 |
 | `/imu/data` | agent -> PC | `sensor_msgs/msg/Imu` | SensorDataQoS: BestEffort, Volatile, KeepLast(5) | 校验并归一化四元数。 |
 | `/joint_states` | local silent publisher | `sensor_msgs/msg/JointState` | SensorDataQoS: BestEffort, Volatile, KeepLast(5) | 保留 publisher，当前静默。 |
@@ -51,7 +53,7 @@ HTBR 是 SSH exec channel 上的版本化二进制帧，不是厂家 UDP 3600 �
 | `auto_charge` | `CMD_MODE 0xA105` | 串行等待稳态 | `AstrallSportModeControl(0xA105)` | `0xB107` 起始 |
 | `exit_charge` | `CMD_MODE 0xA106` | 串行等待稳态 | `AstrallSportModeControl(0xA106)` | `0xB10B` 过程 |
 | `recover` / `recovery` | `CMD_MODE 0xA1FF` | 串行等待稳态 | `AstrallSportModeControl(0xA1FF)` | `0xB1FF` |
-| `/emergency_stop true` | `CMD_ESTOP engage=1` | 最高优先级，锁存零速 | `AstrallMove(0, 0, 0)` 后请求 `0xA101` | `0xB101` |
+| `/emergency_stop true` | `CMD_ESTOP engage=1` | 最高优先级，锁存零速；agent 在独立 worker 中轮询阻尼稳态确认，不阻塞 PING 处理 | `AstrallMove(0, 0, 0)` 后请求 `0xA101` | `0xB101` |
 | `/emergency_stop false` | `CMD_ESTOP engage=0` | 只解除锁存，不重放命令 | 不自动恢复模式或速度 | 由操作者重新确认 |
 | `/joint_commands` | `CMD_JOINT` 不下行 | 返回 FeatureUnavailable | 无关节 API | 不适用 |
 
@@ -77,7 +79,7 @@ HTBR 是 SSH exec channel 上的版本化二进制帧，不是厂家 UDP 3600 �
 
 ## SOP 1：网络与 SSH 信任建立
 
-先从厂家标签、串口或可信管理通道离线核对主机指纹，再写入 known_hosts；`ssh-keyscan` 本身不能证明目标身份。
+先从厂家标签、串口或可信管理通道离线核对主机指纹，再写入 known_hosts；`ssh-keyscan` 本身不能证明目标身份。厂家手册第 4 页给出的默认管理网段示例为 `10.18.0.100`（见 SW01_MANUAL_NOTES.md），实际管理 IP 与 SSH 端口必须以厂家确认值为准，并与 `config/bridge_config.yaml` 的 `ssh.host`/`ssh.port` 保持一致：
 
 ```bash
 ssh-keygen -R <ROBOT_IP>
@@ -132,7 +134,7 @@ ssh <ROBOT_USER>@<ROBOT_IP> 'echo /opt/hypertron/lib | sudo tee /etc/ld.so.conf.
 
 ## SOP 4：配置文件逐项设置
 
-编辑 `<HYPERTRON_WS>/src/hypertron_ros2_bridge/config/bridge_config.yaml`，设置 `ssh.host: "<ROBOT_IP>"`、`ssh.username: "<ROBOT_USER>"`、密钥路径与已核验的 known_hosts。必须保持：
+编辑 `<HYPERTRON_WS>/src/hypertron_ros2_bridge/config/bridge_config.yaml`，设置 `ssh.host`、`ssh.username`、密钥路径与已核验的 known_hosts。必须保持：
 
 ```yaml
 ssh:
@@ -143,7 +145,7 @@ camera:
   enabled: false
 ```
 
-密码应通过受控环境变量或密钥管理提供，不能写入 YAML。核对 `agent_startup_timeout_ms: 65000`、稳态应用心跳超时 500 ms、`heartbeat_hz: 10.0`、`motion_refresh_hz: 50.0` 和 `command_deadman_ms: 100`。
+密码通过受控环境变量 `HYPERTRON_SSH_PASSWORD` 或密钥管理提供，不能写入 YAML。核对关键时序（两侧超时相互独立）：`agent_startup_timeout_ms: 65000`（SDK 初始化宽限）、agent 应用心跳安全超时 `safety.application_timeout_ms: 500`（约 500 ms 未收到 PC PING 即零速并请求阻尼，对齐手册）、PC 稳态存活超时 `ssh.application_timeout_ms: 1500`（≥ 3× `ping_interval_ms` 且大于 agent 安全超时与急停确认时长，保证安全停止先于 PC 断连判定）、`heartbeat_hz: 10.0`、`motion_refresh_hz: 50.0`、`command_deadman_ms: 100` 与急停 ACK 超时 `safety.estop_ack_timeout_ms: 2000`。
 
 以下行为是代码固定值，不是 YAML 选项，避免产生静默无效配置：
 
@@ -205,12 +207,25 @@ ros2 service call /emergency_stop std_srvs/srv/SetBool "{data: true}"
 每次故障都先停止运动、保持支撑与实体安全链路，再按以下决策恢复：
 
 1. SSH 丢失：确认零速和阻尼，PC 清空旧速度/模式；核对网络与主机指纹，重连后重新完成 HELLO、模式选择和新速度命令，绝不回放旧命令。
-2. 心跳超时：约 500 ms 后 agent 明确调用 `AstrallMove(0, 0, 0)` 并请求 `kAstrallModeDamping`（`0xA101`）；确认 `sport_status == 0xB101`，而不是“锁定站立”。继续失联会清空连接和控制权。排除链路问题后从状态门禁重新开始。
+2. 心跳超时：约 500 ms（agent 侧 `safety.application_timeout_ms`）后 agent 明确调用 `AstrallMove(0, 0, 0)` 并请求 `kAstrallModeDamping`（`0xA101`）；确认 `sport_status == 0xB101`，而不是“锁定站立”。继续失联会清空连接和控制权。PC 侧约 1500 ms 无 PONG（`ssh.application_timeout_ms`）才判定通道失效并重连——agent 的安全停止总是先于 PC 断连判定。排除链路问题后从状态门禁重新开始。
 3. 控制权丢失：停止发送运动；由现场确认遥控器/其他控制器已释放后，再申请控制权。agent 不循环抢权。
 4. 模式超时：查看 `error_code`、实际 `sport_status` 和相关 ERROR；不要并发重发模式。故障排除后从 `stand` 重新串行执行。
 5. 未验证里程计：`odometry_scale_verified=false` 时只作诊断观察，不用于定位、闭环控制或安全判断；抓包/标定后才可更改配置。
 6. 相机失败：保持 `camera.enabled: false`，不影响安全控制；验证 UDP 6000 边界、解码与丢包恢复后才可单独启用。
 7. 解除急停：执行 `ros2 service call /emergency_stop std_srvs/srv/SetBool "{data: false}"` 后不会自动运动；重新检查全部状态门禁，重新 `stand`、`move`，再发送新的低速命令。
+
+## 与 universal_slam 组合的适配
+
+本桥不是完整的导航数据源。与 universal_slam（FAST-LIO2 + Nav2）组合时，约定话题与本桥能力的差异必须由适配层补齐：
+
+| universal_slam 约定 | 本桥提供 | 需要的适配 |
+|---|---|---|
+| `/points_raw`（`sensor_msgs/msg/PointCloud2`） | 不提供点云 | 另行实现 UDP 6100 → PointCloud2 驱动（`adapter_sw01` 或独立驱动），并发布 `base_link→lidar` 静态 TF；本桥对 6100 只做标定诊断 |
+| `/imu_raw`（`sensor_msgs/msg/Imu`，BestEffort） | `/imu/data`（SensorDataQoS，帧 `imu_link`） | remap `/imu/data` → `/imu_raw`，核对坐标系并发布 `base_link→imu` 静态 TF |
+| `/odom`（FAST-LIO 输出） | UDP 6101 `/odom`（比例未验证） | FAST-LIO 自带激光惯性里程计；本桥 `/odom` 只作标定参考，`odometry_scale_verified=false` 前不得用于定位、闭环或安全判断 |
+| `/cmd_vel`（Nav2 输出 SI `Twist`） | `/cmd_vel`（归一化 `[-1, 1]`） | adapter_sw01 必须按厂家标定的最大线/角速度把 m/s、rad/s 换算为归一化值后再发布到本桥 |
+
+Nav2 MPPI（`motion_model: "Omni"`）输出 SI 单位 `Twist`，**不能直接**接入本桥 `/cmd_vel`。换算形式为 `v_norm = clamp(v_si / v_max, -1, 1)`，其中 `v_max`（线速度/角速度的最大物理值）必须实机标定，未标定前不得启用自动导航。TF 方面，FAST-LIO 输出 `camera_init→body`，需要静态补齐 `body→base_link` 并与本桥的 `base_link`/`imu_link` 帧约定对齐。
 
 ## 测试与 Review
 
@@ -228,6 +243,8 @@ python -m pytest test/test_package_contract.py -q
 
 ## 已知限制
 
+- 本桥不转发 UDP 6100 LiDAR 点云：HTBR v1 没有点云消息，点云仅做实机标定诊断；需要点云的方案必须另行实现 6100 驱动（见“与 universal_slam 组合的适配”）。
+- `/cmd_vel` 为归一化无量纲指令（`[-1, 1]`），不是 SI 单位；Nav2 的 SI 输出必须经适配层换算。
 - 手册第 26 页未定义 UDP 6101 的字节序、packing、坐标系和固定点比例。
 - 手册未定义 UDP 6000 数据报与 H.264 NAL/访问单元边界。
 - ASTRALL 1.0.7 无关节控制/状态 API，因此 `/joint_commands` 拒绝且 `/joint_states` 静默。

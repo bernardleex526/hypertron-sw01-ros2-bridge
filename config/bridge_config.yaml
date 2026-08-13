@@ -1,9 +1,13 @@
 hypertron_bridge:
   ros__parameters:
     ssh:
-      host: "192.168.1.100"
+      # 厂家手册第 4 页给出的默认管理网段示例；必须以厂家确认的机器人管理 IP 替换。
+      host: "10.18.0.100"
+      # SSH 端口默认 22，按管理员策略调整。
       port: 22
       username: "robot"
+      # 密码只通过受控环境变量 HYPERTRON_SSH_PASSWORD 或密钥管理注入，
+      # 绝不写入本文件；此处保持为空。
       password: ""
       private_key: "~/.ssh/id_ed25519"
       known_hosts: "~/.ssh/known_hosts"
@@ -12,7 +16,10 @@ hypertron_bridge:
       connect_timeout_ms: 5000
       keepalive_interval_ms: 1000
       ping_interval_ms: 200
-      application_timeout_ms: 500
+      # PC 侧稳态存活超时（收到首个 PONG 后生效）。必须 ≥ 3× ping_interval_ms，
+      # 且大于 agent 侧 safety.application_timeout_ms（500 ms）与急停确认轮询
+      # 时长，确保机器人的安全停止先于 PC 断连判定。
+      application_timeout_ms: 1500
       # Must exceed astrall.initialization_timeout_ms.
       agent_startup_timeout_ms: 65000
       reconnect_initial_delay_ms: 1000
@@ -44,8 +51,15 @@ hypertron_bridge:
       camera: "camera_link"
 
     safety:
+      # agent 侧应用心跳安全超时：约 500 ms 未收到 PC PING/PONG 即
+      # AstrallMove(0,0,0) 并请求 damping（对齐手册：约 500 ms 无心跳时清除
+      # SDK 指令并锁定站立）。独立于 PC 侧 ssh.application_timeout_ms。
+      application_timeout_ms: 500
       command_deadman_ms: 100
       mode_timeout_ms: 10000
+      # PC 侧 /emergency_stop 服务等待 agent ACK 的上限（在专用服务线程内等待，
+      # 不阻塞主执行器）。agent 侧急停阻尼稳态确认轮询上限为 min(mode_timeout_ms/5, 500)。
+      estop_ack_timeout_ms: 2000
       queue_capacity: 64
       telemetry_queue_capacity: 256
       max_payload_bytes: 8388608

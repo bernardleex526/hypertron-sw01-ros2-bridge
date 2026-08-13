@@ -295,7 +295,13 @@ class InteractiveStream final : public IByteStream {
               decode_error(frame.payload).request_sequence == request_sequence) {
             return true;
           }
-          if (type == MessageType::HelloAck) return true;
+          if (type == MessageType::Ack &&
+              decode_ack(frame.payload).request_sequence == request_sequence) {
+            return true;
+          }
+          if (type == MessageType::HelloAck || type == MessageType::Pong) {
+            return true;
+          }
         }
       }
       return false;
@@ -327,6 +333,28 @@ class TimeoutUdpSource final : public IUdpSource {
     return std::nullopt;
   }
   void close() noexcept override {}
+};
+
+class GatedDatagramUdpSource final : public IUdpSource {
+ public:
+  explicit GatedDatagramUdpSource(std::vector<std::uint8_t> bytes)
+      : bytes_(std::move(bytes)) {}
+  // 由测试在 HELLO 握手完成后打开，确保数据报在握手后被处理。
+  void open() { gate_.store(true); }
+  std::optional<UdpDatagram> receive(
+      std::chrono::milliseconds) override {
+    if (!gate_.load() || delivered_) return std::nullopt;
+    delivered_ = true;
+    UdpDatagram datagram;
+    datagram.bytes = bytes_;
+    return datagram;
+  }
+  void close() noexcept override {}
+
+ private:
+  std::vector<std::uint8_t> bytes_;
+  std::atomic_bool gate_{false};
+  bool delivered_{};
 };
 
 std::vector<std::uint8_t> command_script(
@@ -619,6 +647,108 @@ TEST(AgentRuntime, ExternalSignalPredicateStopsTimedPipeRead) {
   EXPECT_EQ(run.get(), 0);
   ::close(input_pipe[1]);
   ::close(output_pipe[0]);
+}
+
+TEST(AgentRuntime, EstopConfirmationDoesNotBlockPingProcessing) {
+  FakeSdk sdk;
+  InteractiveStream stream;
+  SteadyMonotonicClock clock;
+  auto agent_config = config();
+  // 默认 mode_timeout=10s -> 急停确认轮询上限 500 ms。若确认仍在 process()
+  // 内同步执行，PING 会排队到确认结束之后，PONG 无法在 250 ms 内返回；
+  // 确认移入独立 worker 后，PING 应被立即应答。
+  agent_config.mode_poll_period = 5ms;
+  agent_config.application_timeout = 2s;  // 避免 CI 调度抖动触发安全停摆
+  AgentRuntime agent(agent_config, sdk, stream, clock);
+  auto run = std::async(std::launch::async, [&agent] { return agent.run(); });
+  stream.push({MessageType::Hello, 1, 1,
+               encode_hello({1, 1, CapabilitySystemState, 7})});
+  ASSERT_TRUE(stream.wait_for_frame(MessageType::HelloAck, 0, 500ms));
+  // FakeSdk 初始 sport_status=0xB104（非阻尼稳态），确认轮询会持续进行。
+  stream.push({MessageType::CmdEstop, 2, 2, encode_estop({true})});
+  stream.push({MessageType::Ping, 3, 3, {}});
+  EXPECT_TRUE(stream.wait_for_frame(MessageType::Pong, 0, 250ms));
+  // 稳态未达成前不得提前 ACK。
+  EXPECT_FALSE(stream.wait_for_frame(MessageType::Ack, 2, 50ms));
+  sdk.set_sport_status(0xB101U);
+  EXPECT_TRUE(stream.wait_for_frame(MessageType::Ack, 2, 500ms));
+  agent.request_stop();
+  EXPECT_EQ(run.get(), 0);
+  const auto frames = stream.written_frames();
+  const auto ack = std::find_if(frames.begin(), frames.end(), [](const Frame& f) {
+    return f.type == MessageType::Ack &&
+           decode_ack(f.payload).request_sequence == 2U;
+  });
+  ASSERT_NE(ack, frames.end());
+  EXPECT_NE(decode_ack(ack->payload).text.find("damping state confirmed"),
+            std::string::npos);
+}
+
+TEST(AgentRuntime, EstopConfirmationTimeoutStillAcksAsRequested) {
+  FakeSdk sdk;
+  InteractiveStream stream;
+  SteadyMonotonicClock clock;
+  auto agent_config = config();
+  agent_config.mode_timeout = 200ms;  // 确认轮询上限 = 40 ms
+  agent_config.mode_poll_period = 2ms;
+  agent_config.application_timeout = 2s;
+  AgentRuntime agent(agent_config, sdk, stream, clock);
+  auto run = std::async(std::launch::async, [&agent] { return agent.run(); });
+  stream.push({MessageType::Hello, 1, 1,
+               encode_hello({1, 1, CapabilitySystemState, 7})});
+  ASSERT_TRUE(stream.wait_for_frame(MessageType::HelloAck, 0, 500ms));
+  sdk.set_sport_status(0xB102U);  // stand：永远达不到阻尼稳态
+  stream.push({MessageType::CmdEstop, 2, 2, encode_estop({true})});
+  // 确认超时后必须仍以 ACK（注明 requested）结束，而不是 ERROR 或静默。
+  EXPECT_TRUE(stream.wait_for_frame(MessageType::Ack, 2, 500ms));
+  agent.request_stop();
+  EXPECT_EQ(run.get(), 0);
+  const auto frames = stream.written_frames();
+  const auto ack = std::find_if(frames.begin(), frames.end(), [](const Frame& f) {
+    return f.type == MessageType::Ack &&
+           decode_ack(f.payload).request_sequence == 2U;
+  });
+  ASSERT_NE(ack, frames.end());
+  EXPECT_NE(decode_ack(ack->payload).text.find("damping requested"),
+            std::string::npos);
+}
+
+TEST(AgentRuntime, InvalidUdp6100DatagramDoesNotClobberLastError) {
+  FakeSdk sdk;
+  InteractiveStream stream;
+  SteadyMonotonicClock clock;
+  auto agent_config = config();
+  agent_config.state_period = 10ms;
+  agent_config.application_timeout = 2s;
+  // 一个畸形的 6100 数据报：头部 magic 正确以外全部无效。
+  std::vector<std::uint8_t> garbage(64, 0x5AU);
+  garbage[0] = 0x55;
+  garbage[1] = 0xAA;
+  GatedDatagramUdpSource lidar(std::move(garbage));
+  TimeoutUdpSource odometry;
+  AgentRuntime agent(agent_config, sdk, stream, clock,
+                     {nullptr, &lidar, &odometry});
+  auto run = std::async(std::launch::async, [&agent] { return agent.run(); });
+  stream.push({MessageType::Hello, 1, 1,
+               encode_hello({1, 1, CapabilitySystemState, 7})});
+  ASSERT_TRUE(stream.wait_for_frame(MessageType::HelloAck, 0, 500ms));
+  // 握手完成后才投递畸形数据报，确保它被 lidar_loop 实际处理。
+  lidar.open();
+  // 等待 RobotState 帧发布。
+  std::this_thread::sleep_for(60ms);
+  agent.request_stop();
+  EXPECT_EQ(run.get(), 0);
+  const auto frames = stream.written_frames();
+  bool saw_robot_state = false;
+  for (const auto& frame : frames) {
+    if (frame.type != MessageType::RobotState) continue;
+    saw_robot_state = true;
+    const auto state = decode_robot_state(frame.payload);
+    // 6100 无效数据报只进入诊断计数，不得覆盖 last_error（否则会掩盖
+    // SDK/链路错误，并且与 6101 里程计错误混为一谈）。
+    EXPECT_EQ(state.last_error.find("6100"), std::string::npos);
+  }
+  EXPECT_TRUE(saw_robot_state);
 }
 
 }  // namespace

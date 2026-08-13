@@ -1,0 +1,13 @@
+# Python（package contract 的 pytest 产物）
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# CMake / colcon 本地构建产物（仅仓库根下的构建目录，避免误忽略源码目录）
+/build/
+/build-*/
+/install/
+/log/
+
+# 编辑器临时文件
+*~

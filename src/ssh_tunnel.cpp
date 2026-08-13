@@ -250,7 +250,7 @@ SshTunnel::SshTunnel(SshConfig config, ISshBackend& backend,
   if (config_.connect_timeout.count() <= 0 ||
       config_.keepalive_interval.count() <= 0 ||
       config_.ping_interval.count() <= 0 ||
-      config_.application_timeout <= config_.ping_interval ||
+      config_.application_timeout < 3 * config_.ping_interval ||
       config_.agent_startup_timeout < config_.application_timeout ||
       config_.reconnect_initial_delay.count() <= 0 ||
       config_.reconnect_max_delay < config_.reconnect_initial_delay ||
@@ -444,6 +444,9 @@ void SshTunnel::run() {
       const auto liveness_timeout =
           received_pong ? config_.application_timeout
                         : config_.agent_startup_timeout;
+      // 稳态存活超时 ≥ 3 个 ping 周期（构造时已校验），且大于 agent 侧的
+      // 500 ms 应用心跳安全超时：agent 的安全停止总是先于 PC 断连判定，
+      // 单个 PONG 抖动不会误拆通道。
       if (now - last_pong > liveness_timeout) channel_ok = false;
     }
     state_.store(ConnectionState::Disconnected);

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -39,6 +40,11 @@ struct AgentRuntime::Impl {
     std::string name;
   };
 
+  struct EstopConfirm {
+    std::uint32_t sequence{};
+    std::chrono::steady_clock::time_point deadline;
+  };
+
   Impl(AgentConfig config_value, IAstrallSdk& sdk_value,
        IByteStream& stream_value, IMonotonicClock& clock_value,
        AgentUdpSources udp_value)
@@ -54,6 +60,7 @@ struct AgentRuntime::Impl {
         sensor_output(config.output_queue_capacity, OverflowPolicy::DropOldest),
         camera_output(2U, OverflowPolicy::DropOldest),
         mode_requests(config.output_queue_capacity, OverflowPolicy::RejectNew),
+        estop_confirms(config.output_queue_capacity, OverflowPolicy::RejectNew),
         decoder(config.max_payload) {
     if (config.heartbeat_period.count() <= 0 ||
         config.motion_period.count() <= 0 || config.state_period.count() <= 0 ||
@@ -76,6 +83,7 @@ struct AgentRuntime::Impl {
   ThreadSafeQueue<Frame> sensor_output;
   ThreadSafeQueue<Frame> camera_output;
   ThreadSafeQueue<ModeRequest> mode_requests;
+  ThreadSafeQueue<EstopConfirm> estop_confirms;
   ProtocolHandler decoder;
   std::mutex sdk_mutex;
   std::atomic_bool stop{false};
@@ -371,38 +379,16 @@ struct AgentRuntime::Impl {
           send_error(frame.sequence, BridgeError::SdkCallFailed,
                      "emergency stop SDK call failed");
         } else {
-          // 轮询等待机器人实际进入阻尼稳态（sport_status == 0xB101U）。
-          // 使用专用短超时（mode_timeout/5，≤500ms）以免阻塞 process() 读循环过久。
-          using namespace std::chrono_literals;
-          // estop 确认轮询使用专用短超时（mode_timeout/5，上限500ms）：
-          // process() 是同步调用，长时间阻塞会导致 ping 无法处理、application_expired() 误触。
-          const auto estop_confirm_timeout =
-              std::min(config.mode_timeout / 5,
-                       std::chrono::duration_cast<decltype(config.mode_timeout)>(500ms));
-          const auto estop_deadline =
-              std::chrono::steady_clock::now() + estop_confirm_timeout;
-          bool damping_confirmed = false;
-          while (std::chrono::steady_clock::now() < estop_deadline &&
-                 !stop.load()) {
-            const auto snap = refresh_snapshot(false);
-            // 阻尼稳态的 sport_status 为 0xB101U（见 CmdMode 分支中
-            // 0xA101U -> expected_status 0xB101U 的映射）；kAstrallModeDamping
-            // (0xA101U) 是模式命令码，不能直接用于状态比较。
-            if (snap.sport_status == 0xB101U) {
-              damping_confirmed = true;
-              break;
-            }
-            std::this_thread::sleep_for(config.mode_poll_period);
-          }
-          if (damping_confirmed) {
-            send_ack(frame.sequence, kAstrallSuccess,
-                     "software emergency stop latched; damping state confirmed");
-          } else {
-            // 请求已被 SDK 接受，但在超时内未观测到阻尼稳态；仍 ACK 但注明未确认。
+          // 急停确认不阻塞 process()：这里只做有界 SDK 调用（各 sdk_call_timeout_ms），
+          // 阻尼稳态（sport_status == 0xB101U）轮询交给专用 estop_loop 执行。
+          // process() 是同步读循环，任何长时间阻塞都会延迟 PING/PONG 应答，进而
+          // 触发 PC 存活超时或 agent 自身的应用心跳安全超时（500 ms，零裕量）。
+          if (!estop_confirms.push(
+                  {frame.sequence,
+                   std::chrono::steady_clock::now() + estop_confirm_timeout()})) {
             send_ack(frame.sequence, kAstrallSuccess,
                      "software emergency stop latched; damping requested "
-                     "(state confirmation timed out — robot may still be "
-                     "transitioning)");
+                     "(confirmation queue full)");
           }
         }
       } else {
@@ -562,6 +548,53 @@ struct AgentRuntime::Impl {
     }
   }
 
+  // 急停阻尼稳态确认的轮询上限：保持有界的 ACK 延迟（PC 侧服务有自身的等待
+  // 超时），同时不再占用 process() 读循环。mode_timeout 必须足够大，避免整除后
+  // 得到 0ms 的死线（下限钳到 1ms）。
+  std::chrono::milliseconds estop_confirm_timeout() const {
+    using namespace std::chrono_literals;
+    return std::max(
+        std::chrono::milliseconds(1),
+        std::min(config.mode_timeout / 5,
+                 std::chrono::duration_cast<std::chrono::milliseconds>(500ms)));
+  }
+
+  // 独立的急停确认 worker：轮询阻尼稳态（sport_status == 0xB101U，见 CmdMode
+  // 分支中 0xA101U -> expected_status 0xB101U 的映射；kAstrallModeDamping
+  // (0xA101U) 是模式命令码，不能直接用于状态比较）。即使超时也 ACK 并注明
+  // "requested"，保证 PC 总能得到确定性结果；PC 断连/停止时队列关闭，未完成的
+  // 确认随连接作废。
+  void estop_loop() {
+    using namespace std::chrono_literals;
+    while (!stop.load()) {
+      auto confirm = estop_confirms.wait_pop_for(20ms);
+      if (!confirm) {
+        if (estop_confirms.closed()) return;
+        continue;
+      }
+      bool damping_confirmed = false;
+      while (std::chrono::steady_clock::now() < confirm->deadline &&
+             !stop.load()) {
+        const auto snapshot = refresh_snapshot(false);
+        if (snapshot.sport_status == 0xB101U) {
+          damping_confirmed = true;
+          break;
+        }
+        std::this_thread::sleep_for(config.mode_poll_period);
+      }
+      if (damping_confirmed) {
+        send_ack(confirm->sequence, kAstrallSuccess,
+                 "software emergency stop latched; damping state confirmed");
+      } else if (!stop.load()) {
+        // 请求已被 SDK 接受，但在超时内未观测到阻尼稳态；仍 ACK 但注明未确认。
+        send_ack(confirm->sequence, kAstrallSuccess,
+                 "software emergency stop latched; damping requested "
+                 "(state confirmation timed out — robot may still be "
+                 "transitioning)");
+      }
+    }
+  }
+
   void odometry_loop() {
     while (!stop.load() && udp.odometry != nullptr) {
       const auto datagram = udp.odometry->receive(std::chrono::milliseconds(50));
@@ -586,13 +619,47 @@ struct AgentRuntime::Impl {
   }
 
   void lidar_loop() {
+    // UDP 6100 点云在本工程只做本地校验与实机标定诊断，不通过 HTBR 转发，
+    // 也不发布任何 ROS 点云话题（HTBR v1 没有点云消息类型）。这里显式计数并
+    // 周期输出 stderr 诊断；无效数据报不再覆盖 last_error，避免掩盖 SDK 或
+    // 链路错误。需要点云的方案（如 universal_slam/FAST-LIO2）必须另行实现
+    // 6100 -> PointCloud2 驱动。
+    std::uint64_t received{};
+    std::uint64_t valid{};
+    std::uint64_t invalid{};
+    auto last_report = std::chrono::steady_clock::now();
     while (!stop.load() && udp.lidar != nullptr) {
       const auto datagram = udp.lidar->receive(std::chrono::milliseconds(50));
+      if (!datagram) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_report >= std::chrono::seconds(10)) {
+          std::cerr
+              << "hypertron_bridge_agent: UDP 6100 lidar diagnostic: "
+                 "received="
+              << received << " valid=" << valid << " invalid=" << invalid
+              << "; point clouds are validated for calibration only and are "
+                 "NOT forwarded (no HTBR point-cloud protocol)"
+              << std::endl;
+          last_report = now;
+        }
+        continue;
+      }
       if (!handshake_complete.load()) continue;
-      if (datagram && !parse_point_cloud_packet(
-                          datagram->bytes, config.lidar_packing,
-                          config.point_coordinate_scale)) {
-        set_last_error("invalid UDP 6100 point-cloud datagram");
+      ++received;
+      if (parse_point_cloud_packet(datagram->bytes, config.lidar_packing,
+                                   config.point_coordinate_scale)) {
+        ++valid;
+      } else {
+        ++invalid;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_report >= std::chrono::seconds(10)) {
+          std::cerr << "hypertron_bridge_agent: invalid UDP 6100 datagram "
+                    << "(received=" << received << " valid=" << valid
+                    << " invalid=" << invalid
+                    << "); verify packing/endianness against a real capture"
+                    << std::endl;
+          last_report = now;
+        }
       }
     }
   }
@@ -691,6 +758,7 @@ int AgentRuntime::run(std::function<bool()> external_stop_requested) {
   std::thread motion([this] { impl_->motion_loop(); });
   std::thread state([this] { impl_->state_loop(); });
   std::thread mode([this] { impl_->mode_loop(); });
+  std::thread estop([this] { impl_->estop_loop(); });
   std::thread odometry;
   std::thread lidar;
   std::thread camera;
@@ -725,10 +793,12 @@ int AgentRuntime::run(std::function<bool()> external_stop_requested) {
   impl_->stop.store(true);
   impl_->close_udp();
   impl_->mode_requests.close();
+  impl_->estop_confirms.close();
   if (heartbeat.joinable()) heartbeat.join();
   if (motion.joinable()) motion.join();
   if (state.joinable()) state.join();
   if (mode.joinable()) mode.join();
+  if (estop.joinable()) estop.join();
   if (odometry.joinable()) odometry.join();
   if (lidar.joinable()) lidar.join();
   if (camera.joinable()) camera.join();
@@ -747,6 +817,7 @@ void AgentRuntime::request_stop() noexcept {
   impl_->stop.store(true);
   impl_->close_udp();
   impl_->mode_requests.close();
+  impl_->estop_confirms.close();
   impl_->control_output.close();
   impl_->state_output.close();
   impl_->odometry_output.close();

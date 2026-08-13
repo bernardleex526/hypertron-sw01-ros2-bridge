@@ -134,6 +134,37 @@ def test_public_sample_only_exposes_effective_configuration() -> None:
         assert fixed_behavior in readme
 
 
+def test_timeout_split_and_ssh_example_are_consistent() -> None:
+    config = (ROOT / "config/bridge_config.yaml").read_text(encoding="utf-8")
+    # 手册默认管理网段示例，README SOP 1 引用同一地址。
+    assert 'host: "10.18.0.100"' in config
+    # PC 稳态存活超时与 agent 应用心跳安全超时相互独立。
+    assert "application_timeout_ms: 1500" in config  # ssh 段（PC）
+    assert "application_timeout_ms: 500" in config  # safety 段（agent）
+    assert "estop_ack_timeout_ms: 2000" in config
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    assert "HYPERTRON_SSH_PASSWORD" in readme
+    assert "10.18.0.100" in readme
+    assert "rmw_qos_profile_services_default" in readme
+
+
+def test_readme_documents_lidar_cmd_vel_and_universal_slam_boundaries() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for token in (
+        "不转发 LiDAR 点云",
+        "与 universal_slam 组合的适配",
+        "归一化无量纲",
+        "不是 SI 单位",
+        "不能直接",
+        "m/s、rad/s",
+        "/points_raw",
+        "odometry_scale_verified=false",
+    ):
+        assert token in readme
+    protocol = (ROOT / "HTBR_PROTOCOL.md").read_text(encoding="utf-8")
+    assert "6100 点云不在 HTBR 内传输" in protocol
+
+
 def test_readme_commands_assume_the_repository_is_the_package_root() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     for required in (

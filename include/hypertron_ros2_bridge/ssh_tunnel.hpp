@@ -33,7 +33,9 @@ struct SshConfig {
   std::chrono::milliseconds connect_timeout{5000};
   std::chrono::milliseconds keepalive_interval{1000};
   std::chrono::milliseconds ping_interval{200};
-  std::chrono::milliseconds application_timeout{500};
+  // PC 侧稳态存活超时：必须 ≥ 3× ping_interval（构造时校验），默认 1500 ms
+  // 以给 agent 的 500 ms 应用心跳安全超时与急停确认轮询留出裕量。
+  std::chrono::milliseconds application_timeout{1500};
   std::chrono::milliseconds agent_startup_timeout{65000};
   std::chrono::milliseconds reconnect_initial_delay{1000};
   std::chrono::milliseconds reconnect_max_delay{30000};
