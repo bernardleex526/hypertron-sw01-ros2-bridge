@@ -1,43 +1,83 @@
-# 实现与安全评审
+# 实现与安全评审（直连驱动）
 
-评审对象为 Hypertron SW01 ROS2/SSH bridge 的 PC 节点、HTBR v1、机器人 agent、ASTRALL SDK 适配、UDP 解析、ROS 数据映射、配置和部署文档。结论：未发现遗留 P0/P1/P2 代码问题；可进入厂家信息补全和实机调试阶段，但不能把本报告当作实机运动安全认证。
+评审对象为 Hypertron SW01 ROS2 直连驱动：PC 上的 `hypertron_driver` 节点直连
+官方 ASTRALL SDK 1.0.7 访问机器人，无 SSH、无 HTBR、无机器人端 agent。
+本报告记录已完成的任务与遗留项。
 
-## 已处理的主要评审项
+## 任务状态
 
-| 级别 | 发现 | 处理结果 |
-|---|---|---|
-| P1 | 仅监听 UDP 6000/6100/6101、未先调用厂家 RGB/LiDAR 订阅 | agent 初始化阶段调用 `AstrallSubscriptionData`，失败即停止启动；测试验证 init→subscribe→acquire 顺序 |
-| P1 | 模式调用收到 SDK 返回成功就提前 ACK | 使用独立串行模式 worker，轮询实际 `sport_status`，到达手册稳态才 ACK，超时/急停返回 ERROR |
-| P1 | 急停与速度/普通命令共用 FIFO，旧速度可积压 | 急停高优先级队列、速度 latest-value mailbox、普通命令有界 FIFO；突发回归测试验证急停先发且只发送最新速度 |
-| P1 | SSH stop 可能在 worker 读取 libssh 时并发释放 session | backend 完全由 worker 持有；stop 先发停止信号、join 后才 disconnect；并发回归测试通过 |
-| P1 | agent writer 失败时 reader 可能永久阻塞 | writer 失败立即关闭字节流以唤醒 reader；回归测试验证无需外部 close 即退出 |
-| P1 | `last_error` 跨线程数据竞争 | 所有读写由 mutex 保护 |
-| P1 | H.264 解码阻塞 SSH 收包线程 | PC 使用容量 2、DropOldest 的独立 camera worker；图像采用 PC ROS 接收时间而非 agent steady-clock 时间 |
-| P1 | 可关闭严格主机密钥校验并自动登记未知主机 | 配置为 false 会被拒绝；libssh 只接受已验证 known_hosts，不自动更新 |
-| P2 | agent 的状态、传感器、里程计、相机共用队列 | 分离为控制、状态、里程计、传感器和相机队列，writer 按安全优先级调度 |
-| P2 | PC `/robot_mode` 可并发覆盖且无完成/超时状态 | PC 同时只允许一个 pending 模式；根据相关 ACK/ERROR 完成，并由 wall timer 清理超时 |
-| P2 | CAMERA_H264 wire order 与批准格式不一致 | 固定为 `stream_id/receive_time/datagram_sequence/raw`，加入 golden bytes 测试 |
-| P2 | HELLO_ACK 缺少 nonce/能力校验 | 检查会话 nonce、协议版本、保留能力位，并在关节语义未定义时拒绝 JOINT capability |
-| P2 | 参数先转无符号后校验，存在负数环绕 | SSH 端口、周期、队列、payload、agent UDP 端口及 u32 字段均先做范围校验 |
-| P2 | IMU 配置错误地控制里程计时间戳 | IMU 与 odometry 使用独立 timestamp source；相机使用 PC 接收时间 |
-| P2 | ROS 命令 QoS 会积压旧命令 | `/cmd_vel` 和 `/joint_commands` 使用 Reliable KeepLast(1)；模式保持 KeepLast(10) 并由 pending gate 串行化 |
-| P2 | SDK 初始化最长 60 秒，但 SSH 500 ms 就判 agent 失活 | 增加 65 秒 agent startup timeout；收到首个 PONG 后才切换到 500 ms steady-state timeout |
+### Task 1–7：已完成并本地验证
 
-## 验证矩阵
+| 任务 | 状态 |
+|---|---|
+| Task 1 构建契约（CMake/package.xml/合同 pytest） | 完成 |
+| Task 2 SDK 抽象与网络预检（`astrall_sdk`/`direct_astrall_sdk`/`network_preflight`） | 完成 |
+| Task 3 安全控制器改造（`RobotController`：driver-ready 门、断连失效、急停锁存） | 完成 |
+| Task 4 直连运行时（`direct_driver_runtime`：worker、心跳、断线重连、模式/运动循环） | 完成 |
+| Task 5 ROS 驱动节点（`driver_node.cpp` / `driver_main.cpp`，`hypertron_driver_node` 可执行） | 完成 |
+| Task 6 配置/launch/文档（`config/driver_config.yaml`、`launch/driver.launch.py`、README/SW01_MANUAL_NOTES 更新、旧 SSH/agent 代码退役） | 完成 |
+| Task 7 工作区集成（ros2_ws symlink + colcon build + launch 存活冒烟 + 旧 `sw01_ros2_driver` COLCON_IGNORE） | 完成 |
+| **分期 3–4 LiDAR 点云/里程计接入**（`subscribe_lidar` discard 订阅、UDP 6100/6101 收流、`/points` 与 `/odom_lidar` 发布、`lidar_stream` 库集成、节点 5 用例 + 运行时 2 用例） | 完成 |
+| **SLAM/Nav2 骨架**（launch/config，待标定） | 完成（骨架） |
 
-- 纯 C++：6 个 CTest target 全部通过，覆盖队列、CRC/分帧/payload、控制门控、agent 生命周期/模式确认、SSH 重连/抢占/并发停止和数据映射。
-- Python 合同：7 个 pytest 全部通过，检查交付结构、ROS 接口声明、camera worker、有效配置、仓库根命令、许可证安装和运维文档。
-- Sanitizer：ASan + UBSan 与 `-Wall -Wextra -Wpedantic -Werror` 运行全部纯测试通过。
-- ROS2：在 Ubuntu 22.04 / ROS2 Humble 上启用 libssh 0.9.6 和 FFmpeg，节点与自定义消息以 warnings-as-errors 完整编译、链接；`ldd` 确认 libssh/libavcodec/libswscale。
-- 厂家 SDK：x86_64 ASTRALL 1.0.7 实库完成 agent-only warnings-as-errors 编译/链接；`ldd` 不含 ROS2 或 libssh。
-- ThreadSanitizer：当前 WSL 的 TSAN runtime 在测试进程启动前报 `unexpected memory mapping`，因此无有效 TSAN 结果；并发路径由锁审计、ASan/UBSan 和专门回归测试覆盖。
-- ROS graph CLI：该 WSL 中跨进程 DDS discovery 对本节点和 ROS 官方 demo talker 均不可用，因此没有把 `ros2 topic list` 冒烟结果记为通过；需在目标 PC 环境执行 README 中的 graph 验证。
+验证矩阵：
 
-## 厂家/实机门禁
+- **纯 CMake**（`-DBUILD_ROS2_BRIDGE=OFF`）：6 项 CTest 全部通过
+  （`thread_safe_queue`、`protocol_handler`、`robot_controller`、
+  `network_preflight`、`direct_driver_runtime`（现 41 个用例，含新增
+  `LidarSubscriptionFailureRetriesConnection` 与 `LidarStreamDisabledNeverSubscribes`）、
+  `lidar_stream`）。
+- **ROS**（`-DASTRALL_SDK_ROOT=...`）：ctest 10 项通过
+  （含 `driver_node`，现 13 个用例，含 5 个 LiDAR 新用例）。
+- **pytest 合同**：`test/test_package_contract.py` 13 项全部通过。
+- **colcon**：`colcon build --packages-select hypertron_ros2_bridge` 通过；
+  `ASTRALL_SDK_ROOT` 默认本机 SDK 路径（可覆盖）。
+- **launch 存活冒烟**：无网络（eno1 无载波）下 `ros2 launch
+  hypertron_ros2_bridge driver.launch.py` 运行 8s 节点存活、持续 preflight
+  重试、无连接、零致动，被 timeout 正常终止（exit 124）；日志无 LiDAR fatal
+  （无网络时 preflight failed 正常）。
+- 安装产物：`readelf` 确认 DT_NEEDED `libASTRALL_SDK.so.1` 与 SDK RUNPATH；
+  `ros2 pkg executables` 仅列出 `hypertron_driver_node`。
 
-以下不是可安全猜测的实现细节，仍保持显式 TODO 和状态标志：
+## 遗留项
 
-1. ASTRALL 1.0.7 没有关节角命令/状态 API；`/joint_commands` 拒绝，`/joint_states` 静默。
-2. 手册未定义 UDP 6100/6101 的字节序、packing、坐标系和固定点比例；必须抓包标定，完成前 `odometry_scale_verified=false`。
-3. 手册未定义 UDP 6000 数据报与 H.264 NAL/访问单元边界；FFmpeg parser 可容忍分片，但需实机验证丢包恢复和关键帧行为。
-4. ARM64 厂家库、目标机器人 SSH/权限、实体急停、悬空测试和 30 分钟断线/重连耐久测试必须在机器狗上完成。
+### 实机验证 — 未进行
+代码级测试不能替代实机运动安全认证。需在目标 PC 与 SW01 上完成：架空或稳定
+支撑下的联调、实体急停可用、遥控器抢权、断线/重连耐久（建议至少 30 分钟），
+以及 ROS 图命令（`ros2 topic list` 等）在目标环境验证。eno1 当前无载波
+（网线未接/机器人未开），全部实机步骤待做。
+
+### ThreadSanitizer — 建议抽查
+之前观察到 WSL 的 TSAN runtime 在测试进程启动前报
+`unexpected memory mapping`（ASLR 兼容问题）。后续建议用
+`setarch -R`（关闭 ASLR）重跑 TSAN 抽查并发路径。
+
+### pointcloud_to_laserscan 未安装
+
+`config/laserscan_converter.yaml` 与 `launch/mapping.launch.py` 引用了
+`ros-humble-pointcloud-to-laserscan`，但本机**未安装**该包。用户需
+`sudo apt install ros-humble-pointcloud-to-laserscan`；在此之前
+`mapping.launch.py` 完整启动会报 executable not found（预期，不做容错）。
+`package.xml` 已声明 `pointcloud_to_laserscan` 为 per-包 exec_depend（ROS 2
+中由用户显式 apt 安装）。
+
+### LiDAR 比例标定 — 未进行
+`/points`（`lidar.point_position_scale=1e-3`）与 `/odom_lidar`
+（`odom_position_scale=1e-6`、`odom_quaternion_scale=1.0`）用的是手册默认比例，
+**未实机抓包标定**。需用实机抓包（SOF `0xAA55` / TAIL `0xFF00`、packed/aligned
+两种布局）确认坐标比例与四元数方向后再作数值真值使用；建图需先确认点云几何，
+再接入 `pointcloud_to_laserscan` 等转换。提供点云/里程计旁路流不构成几何或里程
+真值保证。
+
+## 提交记录
+
+全部工作（Task 1–7、LiDAR 接入分期 1–4、SLAM/Nav2 骨架、终审修复）以单个
+提交合入并覆盖主分支；旧 SSH/agent 架构历史保存在远端
+`archive/legacy-ssh-agent` 分支备查。
+
+## 说明
+
+- 本报告不构成实机运动安全认证。所有实机步骤均应由具备厂家授权和现场安全
+  责任的操作者执行。
+- `odometry.scale_verified=false` 且默认 `odom.publish_tf=false`，标定前不得把
+  里程计数值当作物理真值。

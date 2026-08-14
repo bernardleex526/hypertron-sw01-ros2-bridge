@@ -811,7 +811,7 @@ std::optional<PointCloudPacket> parse_point_cloud_packet(
     packet.points.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
       const auto* point = datagram.data() + points_offset + i * kPointSize;
-      LidarPoint decoded;
+      ProtocolLidarPoint decoded;
       decoded.x = static_cast<double>(read_i32_le(point)) * coordinate_scale;
       decoded.y =
           static_cast<double>(read_i32_le(point + 4U)) * coordinate_scale;

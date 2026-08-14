@@ -2,7 +2,7 @@
 <package format="3">
   <name>hypertron_ros2_bridge</name>
   <version>0.1.0</version>
-  <description>SSH bridge between ROS2 and the Hypertron SW01 ASTRALL SDK.</description>
+  <description>Direct UDP ROS 2 driver for the Hypertron SW01 using the vendor x86_64 ASTRALL SDK.</description>
   <maintainer email="bernardleex526@users.noreply.github.com">Hypertron Bridge Maintainer</maintainer>
   <license>Apache-2.0</license>
 
@@ -10,17 +10,24 @@
   <build_depend>rosidl_default_generators</build_depend>
 
   <depend>geometry_msgs</depend>
-  <depend>libssh-dev</depend>
   <depend>nav_msgs</depend>
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>tf2_ros</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
+
+  <!-- 建图/导航骨架运行依赖 -->
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>pointcloud_to_laserscan</exec_depend>
+
   <member_of_group>rosidl_interface_packages</member_of_group>
 
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_pytest</test_depend>
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
 

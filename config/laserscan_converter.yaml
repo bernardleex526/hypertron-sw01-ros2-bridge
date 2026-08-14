@@ -1,0 +1,35 @@
+# pointcloud_to_laserscan_node 参数骨架。
+# 本文件全部几何/外参为占位值 —— 实机标定后回填（见
+# docs/REAL_MACHINE_CALIBRATION.md B8/B10）。
+# 未标定禁止实机使用；坐标轴/高度与 base_link→lidar 外参必须先确认真值。
+#
+# 参数名以 ROS 2 Humble 版 pointcloud_to_laserscan 为准（声明源自
+# src/pointcloud_to_laserscan_node.cpp）。Humble 没有 concurrency_level 参数，
+# 提交（订阅）缓冲由 queue_size 控制，已在下方设置。
+pointcloud_to_laserscan:
+  ros__parameters:
+    # 把点云变换到哪个目标 frame。占位值 —— 实机标定后回填。
+    # 需 base_link→lidar 静态 TF 就绪（enable_tf_skeleton 开启后的 TF）。
+    target_frame: "base_link"
+
+    # 高度裁剪（米）：只投影该高度带内的点成 2D 激光。占位值，B8/B10 后回填。
+    min_height: -0.5
+    max_height: 0.5
+
+    # 测角（弧度）：2D scan 覆盖角度范围与角分辨率。占位值。
+    angle_min: -3.14159
+    angle_max: 3.14159
+    angle_increment: 0.0058
+
+    # 有效测距（米）与扫描周期。求最大值依据 max_laser_range。占位值。
+    range_min: 0.1
+    range_max: 12.0
+    scan_time: 0.1
+
+    # 变换查找超时 / 入队缓冲。占位值。
+    transform_tolerance: 0.1
+    queue_size: 10
+
+    # 越界时以 inf 表达（true）或丢弃（false）；inf_epsilon 为量化裕度。
+    use_inf: true
+    inf_epsilon: 1.0

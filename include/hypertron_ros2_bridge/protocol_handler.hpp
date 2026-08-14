@@ -216,7 +216,11 @@ CameraChunkPayload decode_camera_chunk(const std::vector<std::uint8_t>& bytes);
 
 enum class PackingMode { Auto, Packed, NaturalAligned };
 
-struct LidarPoint {
+// Legacy proprietary-protocol point type. Renamed (ProtocolLidarPoint) so it
+// does not collide with the project's LiDAR stream library's `LidarPoint`
+// (hypertron_ros2_bridge/lidar_stream.hpp), which the direct driver node
+// includes for the UDP 6100 bypass stream.
+struct ProtocolLidarPoint {
   double x{};
   double y{};
   double z{};
@@ -227,7 +231,7 @@ struct PointCloudPacket {
   std::uint64_t device_time{};
   std::uint32_t total_points{};
   std::uint32_t packet_index{};
-  std::vector<LidarPoint> points;
+  std::vector<ProtocolLidarPoint> points;
 };
 
 struct OdometryPacket {

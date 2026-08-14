@@ -54,8 +54,9 @@ struct EstopDecision {
 };
 
 // Implements the ASTRALL safety gates documented on manual pages 16-22:
-// Move is legal only with an active link, SDK authority, Move sport state,
-// no system error and no software emergency-stop latch.
+// Move is legal only with an explicit driver-ready handshake, an active link,
+// SDK authority, Move sport state, no system error and no software
+// emergency-stop latch.
 class RobotController {
  public:
   RobotController(ControllerConfig config, IMonotonicClock& clock);
@@ -66,7 +67,15 @@ class RobotController {
   EstopDecision clear_estop();
   ModeDecision request_mode(std::string_view name);
   void complete_mode_transition(bool success);
-  void set_negotiated_ready(bool ready);
+  // Arms the driver readiness gate. The direct runtime calls this only after
+  // a fresh connection has been fully re-established; a ready status reported
+  // by the robot alone never re-arms motion.
+  void set_driver_ready(bool ready);
+  // True while a mode transition is pending and motion is gated.
+  bool mode_transition_pending() const;
+  // Clears readiness, pending mode and velocity after a connection loss.
+  // The software emergency-stop latch is deliberately preserved.
+  void invalidate_connection();
   void update_robot_state(const ControllerStatus& state);
 
   bool reject_joint_command(std::string_view reason);
@@ -88,7 +97,7 @@ class RobotController {
   IMonotonicClock::time_point last_velocity_time_{};
   bool has_velocity_{false};
   bool estop_latched_{false};
-  bool negotiated_ready_{false};
+  bool driver_ready_{false};
   bool motion_transition_gate_{false};
   bool mode_transition_pending_{false};
   std::uint16_t pending_mode_{0};

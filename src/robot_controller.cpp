@@ -100,9 +100,9 @@ ModeDecision RobotController::request_mode(std::string_view name) {
   }
 
   std::lock_guard<std::mutex> lock(mutex_);
-  if (!negotiated_ready_) {
+  if (!driver_ready_) {
     return {false, mode->second, BridgeError::Protocol,
-            "HELLO negotiation is not complete"};
+            "driver readiness gate is not armed"};
   }
   if (mode_transition_pending_) {
     return {false, mode->second, BridgeError::InvalidCommand,
@@ -141,15 +141,31 @@ void RobotController::complete_mode_transition(bool success) {
   force_zero_locked();
 }
 
-void RobotController::set_negotiated_ready(bool ready) {
+void RobotController::set_driver_ready(bool ready) {
   std::lock_guard<std::mutex> lock(mutex_);
-  negotiated_ready_ = ready;
+  driver_ready_ = ready;
   if (!ready) {
     mode_transition_pending_ = false;
     pending_mode_ = 0;
     motion_transition_gate_ = true;
     force_zero_locked();
   }
+}
+
+bool RobotController::mode_transition_pending() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return mode_transition_pending_;
+}
+
+void RobotController::invalidate_connection() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  driver_ready_ = false;
+  mode_transition_pending_ = false;
+  pending_mode_ = 0;
+  motion_transition_gate_ = true;
+  force_zero_locked();
+  // estop_latched_ is deliberately preserved: a connection loss must not
+  // silently clear a software emergency stop.
 }
 
 void RobotController::update_robot_state(const ControllerStatus& state) {
@@ -190,9 +206,9 @@ ControllerStatus RobotController::status() const {
 }
 
 VelocityDecision RobotController::rejection_locked() const {
-  if (!negotiated_ready_) {
+  if (!driver_ready_) {
     return {false, {}, BridgeError::Protocol,
-            "HELLO negotiation is not complete"};
+            "driver readiness gate is not armed"};
   }
   if (!status_.sdk_linked) {
     return {false, {}, BridgeError::SdkDisconnected,
@@ -219,7 +235,7 @@ VelocityDecision RobotController::rejection_locked() const {
 }
 
 bool RobotController::movement_ready_locked() const {
-  return negotiated_ready_ && !motion_transition_gate_ &&
+  return driver_ready_ && !motion_transition_gate_ &&
          !mode_transition_pending_ && status_.sdk_linked &&
          status_.control_authority &&
          status_.sport_status == kSportStateMove && status_.error_code == 0U &&
