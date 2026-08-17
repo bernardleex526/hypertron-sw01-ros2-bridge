@@ -150,8 +150,9 @@ class FakeAstrallSdk final : public IAstrallSdk {
     return result;
   }
 
-  Result subscribe_lidar(std::uint32_t timeout_ms) override {
-    record({"subscribe_lidar", timeout_ms, false, {}, {}, 0});
+  Result subscribe_lidar(SubscriptionFrequency frequency,
+                         std::uint32_t timeout_ms) override {
+    record({"subscribe_lidar", timeout_ms, false, frequency, {}, 0});
     return next_subscribe_lidar.get();
   }
 

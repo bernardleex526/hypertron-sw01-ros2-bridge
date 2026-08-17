@@ -25,6 +25,9 @@ hypertron_driver:
       imu_frequency_hz: 50
       sport_frequency_hz: 50
       lidar_enabled: true
+      # LiDAR 订阅频率：1 Hz 是保守默认；若实机点云/里程计频率不足或
+      # 与 frame_timeout_ms 冲突，可按实机抓包结果调高（25/50/125/250）。
+      lidar_frequency_hz: 1
 
     lidar:
       point_cloud_port: 6100
@@ -35,17 +38,22 @@ hypertron_driver:
       point_position_scale: 0.001
       odom_position_scale: 0.000001
       odom_quaternion_scale: 1.0
+      # 6101 四元数分量顺序：xyzw（默认）或 wxyz（实机抓包后回填）。
+      odom_quaternion_order: "xyzw"
       frame_id: "lidar"
       frame_timeout_ms: 300
       max_parallel_frames: 4
       max_points_per_frame: 2000000
-      # 注意：每包最多 50 点，4096 包只能组 204800 点；若实机单帧超过该
-      # 值，必须调大 max_packets_per_frame（节点启动时会对此告警）。
-      max_packets_per_frame: 4096
+      # 每包最多 50 点；默认 40000 包可组满 2,000,000 点。
+      # 若实机单帧点数/包数不同，按抓包结果调整。
+      max_packets_per_frame: 40000
 
     odom_lidar:
       parent_frame: "odom"
       child_frame: "lidar"
+      # 将 /odom_lidar 作为 odom->lidar TF 发布；需 odometry.scale_verified=true
+      # 且 mapping.launch 提供 lidar->base_link 静态 TF 后才可进入 SLAM/Nav2。
+      publish_tf: false
       pose_covariance_diagonal: [0.05, 0.05, 0.05, 0.01, 0.01, 0.01]
 
     sdk:

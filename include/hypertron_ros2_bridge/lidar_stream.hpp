@@ -7,6 +7,7 @@
 // so the library builds and is fully testable in the pure CMake
 // configuration (BUILD_ROS2_BRIDGE=OFF).
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -24,15 +25,20 @@ namespace hypertron_ros2_bridge {
 
 // One 28-byte point from AstrallPosCloudData. The raw r/g/b/a uint32_t
 // values keep the vendor byte order; this library never guesses a channel
-// order (the upper layer decides how to interpret them).
+// order (the upper layer decides how to interpret them). All four uint32_t
+// channels are preserved so no bytes are discarded as padding.
 struct LidarPoint {
   float x{};
   float y{};
   float z{};
+  // First RGBA channel, kept for backward compatibility / PointXYZRGBA.
   std::uint32_t rgba{};
+  // All four raw 32-bit RGBA channels from the 28-byte point record.
+  std::array<std::uint32_t, 4> rgba_channels{};
 
   friend bool operator==(const LidarPoint& a, const LidarPoint& b) noexcept {
-    return a.x == b.x && a.y == b.y && a.z == b.z && a.rgba == b.rgba;
+    return a.x == b.x && a.y == b.y && a.z == b.z &&
+           a.rgba == b.rgba && a.rgba_channels == b.rgba_channels;
   }
 };
 
@@ -75,6 +81,9 @@ struct LidarParseConfig {
   // Scale applied to the int64 odometry quaternion components before the
   // resulting vector is normalized to unit length.
   double odom_quaternion_scale{1.0};
+  // Order of the four int64 quaternion components in the UDP 6101 packet.
+  // "xyzw" (default) reads them as qx,qy,qz,qw; "wxyz" reads w,x,y,z.
+  std::string odom_quaternion_order{"xyzw"};
 };
 
 // Uniform parse outcome for a whole datagram. `ok` is true only when the
@@ -139,7 +148,11 @@ struct AssemblerConfig {
   // bounded: a packet whose index exceeds this cap (1-based: index > cap;
   // the 0-based analogue is index >= cap) is rejected outright, so a sparse
   // or hostile index sequence cannot allocate unbounded memory.
-  std::size_t max_packets_per_frame{4096};
+  //
+  // The default matches max_points_per_frame=2,000,000 / 50 points per
+  // packet = 40,000 packets, so a full frame is not rejected by the packet
+  // cap.
+  std::size_t max_packets_per_frame{40000};
 };
 
 // Reassembles a single point-cloud frame from its UDP packet sequence

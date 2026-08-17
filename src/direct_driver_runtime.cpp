@@ -592,9 +592,11 @@ Result DirectDriverRuntime::subscribe_telemetry() {
   }
   // LIDAR discard subscription: opens the robot's UDP 6100/6101 push streams.
   // Reuses the same failure -> session reconnect path as imu/sport; every
-  // reconnection subscribes again.
-  if (config_.enable_lidar_stream) {
-    const Result lidar = sdk_->subscribe_lidar(config_.sdk_call_timeout_ms);
+  // reconnection subscribes again. Frequency Disabled skips the subscription.
+  if (config_.enable_lidar_stream &&
+      config_.lidar_freq != SubscriptionFrequency::Disabled) {
+    const Result lidar = sdk_->subscribe_lidar(
+        config_.lidar_freq, config_.sdk_call_timeout_ms);
     if (!lidar.success()) {
       return lidar;
     }

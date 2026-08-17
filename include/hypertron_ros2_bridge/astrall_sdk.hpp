@@ -152,9 +152,9 @@ class IAstrallSdk {
   // (point cloud) / 6101 (odometry) push streams so the node can receive
   // them on its own sockets. No payload ever flows through the callback;
   // the callback is a no-op, so there is nothing to forward. The frequency
-  // (a fixed non-zero value) is decided internally by the adapter and is not
-  // part of this method's contract.
-  virtual Result subscribe_lidar(std::uint32_t timeout_ms) = 0;
+  // is caller-configurable; use Disabled to skip the subscription.
+  virtual Result subscribe_lidar(SubscriptionFrequency frequency,
+                                 std::uint32_t timeout_ms) = 0;
   virtual Result move(Velocity velocity, std::uint32_t timeout_ms) = 0;
   virtual Result set_mode(std::uint16_t mode, std::uint32_t timeout_ms) = 0;
   virtual SdkSnapshot snapshot() = 0;
@@ -193,7 +193,8 @@ class DirectAstrallSdk final : public IAstrallSdk {
   Result subscribe_sport(SubscriptionFrequency frequency,
                          SportCallback callback,
                          std::uint32_t timeout_ms) override;
-  Result subscribe_lidar(std::uint32_t timeout_ms) override;
+  Result subscribe_lidar(SubscriptionFrequency frequency,
+                         std::uint32_t timeout_ms) override;
   Result move(Velocity velocity, std::uint32_t timeout_ms) override;
   Result set_mode(std::uint16_t mode, std::uint32_t timeout_ms) override;
   SdkSnapshot snapshot() override;

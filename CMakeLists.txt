@@ -68,6 +68,8 @@ if(BUILD_TESTING)
   find_package(GTest REQUIRED)
 
   add_executable(test_thread_safe_queue test/test_thread_safe_queue.cpp)
+  target_include_directories(test_thread_safe_queue PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include)
   target_link_libraries(test_thread_safe_queue PRIVATE
     GTest::gtest_main Threads::Threads)
   add_test(NAME thread_safe_queue COMMAND test_thread_safe_queue)

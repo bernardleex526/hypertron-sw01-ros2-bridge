@@ -54,6 +54,7 @@ struct RuntimeConfig {
   // Telemetry subscription rates.
   SubscriptionFrequency imu_freq{SubscriptionFrequency::Hz50};
   SubscriptionFrequency sport_freq{SubscriptionFrequency::Hz50};
+  SubscriptionFrequency lidar_freq{SubscriptionFrequency::Hz1};
   // When true the connected session also opens the LIDAR discard subscription
   // (enables the robot's UDP 6100/6101 push streams). Disabled sessions never
   // call subscribe_lidar.

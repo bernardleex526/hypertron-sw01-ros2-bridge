@@ -441,6 +441,7 @@ struct HypertronDriverNode::Impl {
     node.declare_parameter("subscriptions.imu_frequency_hz", 50);
     node.declare_parameter("subscriptions.sport_frequency_hz", 50);
     node.declare_parameter("subscriptions.lidar_enabled", true);
+    node.declare_parameter("subscriptions.lidar_frequency_hz", 1);
 
     node.declare_parameter("topics.points", "/points");
     node.declare_parameter("topics.odom_lidar", "/odom_lidar");
@@ -452,6 +453,7 @@ struct HypertronDriverNode::Impl {
     node.declare_parameter("lidar.point_position_scale", 1.0e-3);
     node.declare_parameter("lidar.odom_position_scale", 1.0e-6);
     node.declare_parameter("lidar.odom_quaternion_scale", 1.0);
+    node.declare_parameter("lidar.odom_quaternion_order", "xyzw");
     node.declare_parameter("lidar.frame_id", "lidar");
     node.declare_parameter("lidar.frame_timeout_ms", 300);
     node.declare_parameter("lidar.max_parallel_frames", 4);
@@ -460,6 +462,7 @@ struct HypertronDriverNode::Impl {
 
     node.declare_parameter("odom_lidar.parent_frame", "odom");
     node.declare_parameter("odom_lidar.child_frame", "lidar");
+    node.declare_parameter("odom_lidar.publish_tf", false);
     node.declare_parameter("odom_lidar.pose_covariance_diagonal",
                            std::vector<double>{0.05, 0.05, 0.05, 0.01, 0.01, 0.01});
 
@@ -586,6 +589,13 @@ struct HypertronDriverNode::Impl {
       }
     }
 
+    const std::string odom_quat_order =
+        node.get_parameter("lidar.odom_quaternion_order").as_string();
+    if (odom_quat_order != "xyzw" && odom_quat_order != "wxyz") {
+      fail("lidar.odom_quaternion_order='" + odom_quat_order +
+           "' is not 'xyzw' or 'wxyz'");
+    }
+
     // Heartbeat failure threshold and reconnect backoff ordering.
     const int heartbeat_max_failures =
         node.get_parameter("sdk.heartbeat_max_failures").as_int();
@@ -643,6 +653,8 @@ struct HypertronDriverNode::Impl {
         node.get_parameter("subscriptions.imu_frequency_hz").as_int());
     sport_freq_ = frequency_from_hz(
         node.get_parameter("subscriptions.sport_frequency_hz").as_int());
+    lidar_freq_ = frequency_from_hz(
+        node.get_parameter("subscriptions.lidar_frequency_hz").as_int());
 
     const std::string order =
         node.get_parameter("imu.quaternion_order").as_string();
@@ -712,10 +724,14 @@ struct HypertronDriverNode::Impl {
         node.get_parameter("lidar.odom_position_scale").as_double();
     lidar_.odom_quaternion_scale =
         node.get_parameter("lidar.odom_quaternion_scale").as_double();
+    lidar_.odom_quaternion_order =
+        node.get_parameter("lidar.odom_quaternion_order").as_string();
     odom_lidar_.parent_frame =
         node.get_parameter("odom_lidar.parent_frame").as_string();
     odom_lidar_.child_frame =
         node.get_parameter("odom_lidar.child_frame").as_string();
+    odom_lidar_.publish_tf =
+        node.get_parameter("odom_lidar.publish_tf").as_bool();
     odom_lidar_.pose_covariance_diagonal =
         node.get_parameter("odom_lidar.pose_covariance_diagonal")
             .as_double_array();
@@ -831,17 +847,28 @@ struct HypertronDriverNode::Impl {
 
   void decide_tf_broadcaster() {
     const bool publish_tf = node.get_parameter("odom.publish_tf").as_bool();
+    const bool publish_lidar_tf =
+        node.get_parameter("odom_lidar.publish_tf").as_bool();
     const bool scale_verified =
         node.get_parameter("odometry.scale_verified").as_bool();
+
     if (publish_tf && !scale_verified) {
       RCLCPP_ERROR(node.get_logger(),
                    "invalid configuration: odom.publish_tf requires "
                    "odometry.scale_verified");
       tf_broadcaster_.reset();
-      return;
-    }
-    if (publish_tf) {
+    } else if (publish_tf) {
       tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(node);
+    }
+
+    if (publish_lidar_tf && !scale_verified) {
+      RCLCPP_ERROR(node.get_logger(),
+                   "invalid configuration: odom_lidar.publish_tf requires "
+                   "odometry.scale_verified");
+      lidar_tf_broadcaster_.reset();
+    } else if (publish_lidar_tf) {
+      lidar_tf_broadcaster_ =
+          std::make_unique<tf2_ros::TransformBroadcaster>(node);
     }
   }
 
@@ -864,6 +891,7 @@ struct HypertronDriverNode::Impl {
     parse_cfg.point_position_scale = lidar_.point_position_scale;
     parse_cfg.odom_position_scale = lidar_.odom_position_scale;
     parse_cfg.odom_quaternion_scale = lidar_.odom_quaternion_scale;
+    parse_cfg.odom_quaternion_order = lidar_.odom_quaternion_order;
 
     AssemblerConfig assembler_cfg;
     assembler_cfg.frame_timeout = std::chrono::milliseconds(lidar_.frame_timeout_ms);
@@ -1014,6 +1042,27 @@ struct HypertronDriverNode::Impl {
     // No twist is reported by the lidar stream; leave the 6x6 twist
     // covariance and the twist at their all-zero defaults.
     odom_lidar_pub_->publish(msg);
+    if (lidar_tf_broadcaster_) {
+      publish_lidar_tf(odom, norm);
+    }
+  }
+
+  // Publishes the LiDAR odometry as odom->child_frame TF when explicitly
+  // enabled and odometry.scale_verified=true. With a static lidar->base_link
+  // transform this completes the odom->base_link chain for SLAM/Nav2.
+  void publish_lidar_tf(const LidarOdometry& odom, double norm) {
+    geometry_msgs::msg::TransformStamped t;
+    t.header.stamp = node.get_clock()->now();
+    t.header.frame_id = odom_lidar_.parent_frame;
+    t.child_frame_id = odom_lidar_.child_frame;
+    t.transform.translation.x = odom.x;
+    t.transform.translation.y = odom.y;
+    t.transform.translation.z = odom.z;
+    t.transform.rotation.x = odom.qx / norm;
+    t.transform.rotation.y = odom.qy / norm;
+    t.transform.rotation.z = odom.qz / norm;
+    t.transform.rotation.w = odom.qw / norm;
+    lidar_tf_broadcaster_->sendTransform(t);
   }
 
   static bool finite_double(double v) { return std::isfinite(v); }
@@ -1077,6 +1126,7 @@ struct HypertronDriverNode::Impl {
 
     cfg.imu_freq = imu_freq_;
     cfg.sport_freq = sport_freq_;
+    cfg.lidar_freq = lidar_freq_;
     cfg.enable_lidar_stream = lidar_enabled_;
 
     if (!sdk) {
@@ -1247,6 +1297,7 @@ struct HypertronDriverNode::Impl {
   // Parameters resolved at construction.
   SubscriptionFrequency imu_freq_{SubscriptionFrequency::Hz50};
   SubscriptionFrequency sport_freq_{SubscriptionFrequency::Hz50};
+  SubscriptionFrequency lidar_freq_{SubscriptionFrequency::Hz1};
   bool quaternion_order_wxyz_{false};
   std::array<double, 9> orientation_covariance_{};
   std::array<double, 9> angular_velocity_covariance_{};
@@ -1275,10 +1326,12 @@ struct HypertronDriverNode::Impl {
     double point_position_scale{1.0e-3};
     double odom_position_scale{1.0e-6};
     double odom_quaternion_scale{1.0};
+    std::string odom_quaternion_order{"xyzw"};
   } lidar_;
   struct OdomLidarParams {
     std::string parent_frame{"odom"};
     std::string child_frame{"lidar"};
+    bool publish_tf{false};
     std::vector<double> pose_covariance_diagonal{0.05, 0.05, 0.05, 0.01, 0.01, 0.01};
   } odom_lidar_;
 
@@ -1294,6 +1347,7 @@ struct HypertronDriverNode::Impl {
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr estop_srv_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr authority_srv_;
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
+  std::unique_ptr<tf2_ros::TransformBroadcaster> lidar_tf_broadcaster_;
 
   // Telemetry/state guarded by state_mutex_. Callbacks and the publishing
   // helpers share it; never call runtime_ while holding it.

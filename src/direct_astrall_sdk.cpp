@@ -922,7 +922,8 @@ Result DirectAstrallSdk::subscribe_sport(SubscriptionFrequency frequency,
   return Result::ok();
 }
 
-Result DirectAstrallSdk::subscribe_lidar(std::uint32_t timeout_ms) {
+Result DirectAstrallSdk::subscribe_lidar(SubscriptionFrequency frequency,
+                                         std::uint32_t timeout_ms) {
   if (in_callback_context(impl_.get())) {
     return reentrant_failure();
   }
@@ -950,13 +951,8 @@ Result DirectAstrallSdk::subscribe_lidar(std::uint32_t timeout_ms) {
   std::uint16_t code = 0;
   {
     VendorCallScope vendor_scope{impl_.get()};
-    // Frequency is fixed to 1 Hz (ASTRALL_SUB_FREQ_1HZ, numerically 1): any
-    // non-zero frequency opens the UDP 6100/6101 push streams and the discard
-    // callback never interprets a payload, so a minimal non-zero rate is all
-    // this contract guarantees. The vendor returns ASTRALL_RES_SUCCEESSED and
-    // the streams flow to the node's own sockets.
     code = impl_->vendor.subscribe(
-        SubscriptionTopic::Lidar, static_cast<std::uint16_t>(SubscriptionFrequency::Hz1),
+        SubscriptionTopic::Lidar, static_cast<std::uint16_t>(frequency),
         [weak](const void*, std::uint16_t) {
           deliver_lidar_discard(weak);
         },

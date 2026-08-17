@@ -24,6 +24,7 @@ from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description() -> LaunchDescription:
@@ -31,6 +32,7 @@ def generate_launch_description() -> LaunchDescription:
     pkg = get_package_share_directory('hypertron_ros2_bridge')
 
     enable_tf_skeleton = LaunchConfiguration('enable_tf_skeleton')
+    enable_odom_tf = LaunchConfiguration('enable_odom_tf')
     use_rviz = LaunchConfiguration('use_rviz')
 
     return LaunchDescription([
@@ -38,9 +40,17 @@ def generate_launch_description() -> LaunchDescription:
             'enable_tf_skeleton',
             default_value='false',
             description=(
-                '危险：置 true 会以占位外参(0,0,0,0,0,0)发布 base_link→lidar 与 '
+                '危险：置 true 会以占位外参(0,0,0,0,0,0)发布 lidar→base_link 与 '
                 'base_link→imu_link 静态 TF。未标定禁止开启（见 '
                 'docs/REAL_MACHINE_CALIBRATION.md B8/B10）。'
+            ),
+        ),
+        DeclareLaunchArgument(
+            'enable_odom_tf',
+            default_value='false',
+            description=(
+                '是否让驱动把 /odom_lidar 发布为 odom→lidar TF。'
+                '仅在 odometry.scale_verified=true 且外参标定后开启。'
             ),
         ),
         DeclareLaunchArgument(
@@ -59,6 +69,7 @@ def generate_launch_description() -> LaunchDescription:
             output='screen',
             parameters=[
                 pkg + '/config/driver_config.yaml',
+                {'odom_lidar.publish_tf': ParameterValue(enable_odom_tf, value_type=bool)},
             ],
         ),
 
@@ -95,20 +106,22 @@ def generate_launch_description() -> LaunchDescription:
         ),
 
         # ------------------------------------------------------------------
-        # TF 骨架（默认关闭）：base_link→lidar 与 base_link→imu_link
+        # TF 骨架（默认关闭）：lidar→base_link 与 base_link→imu_link
         # 占位平移/姿态全部为 0（0,0,0,0,0,0）—— 未标定禁止开启。
+        # lidar→base_link 方向与驱动发布的 odom→lidar TF 组成
+        # odom→lidar→base_link 链，供 SLAM/Nav2 使用。
         # 语法来自 tf2_ros static_transform_publisher 可执行程序的新式参数。
         # ------------------------------------------------------------------
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
-            name='static_tf_base_to_lidar',
+            name='static_tf_lidar_to_base',
             output='screen',
             condition=IfCondition(enable_tf_skeleton),
             arguments=[
                 '--x', '0.0', '--y', '0.0', '--z', '0.0',
                 '--yaw', '0.0', '--pitch', '0.0', '--roll', '0.0',
-                '--frame-id', 'base_link', '--child-frame-id', 'lidar',
+                '--frame-id', 'lidar', '--child-frame-id', 'base_link',
             ],
         ),
         Node(

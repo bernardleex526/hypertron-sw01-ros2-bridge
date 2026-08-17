@@ -1,6 +1,7 @@
 #include "hypertron_ros2_bridge/lidar_stream.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -71,6 +72,10 @@ bool ValidateScales(const LidarParseConfig& config) {
          std::fabs(config.point_position_scale) <= 1e9 &&
          std::fabs(config.odom_position_scale) <= 1e9 &&
          std::fabs(config.odom_quaternion_scale) <= 1e9;
+}
+
+bool ValidQuaternionOrder(const std::string& order) {
+  return order == "xyzw" || order == "wxyz";
 }
 
 std::string MakeReason(const char* what) {
@@ -169,7 +174,11 @@ bool ParsePointCloudWithLayout(const std::uint8_t* data, std::size_t len,
     pt.x = static_cast<float>(x);
     pt.y = static_cast<float>(y);
     pt.z = static_cast<float>(z);
-    pt.rgba = ReadU32LE(p + 12);
+    pt.rgba_channels[0] = ReadU32LE(p + 12);
+    pt.rgba_channels[1] = ReadU32LE(p + 16);
+    pt.rgba_channels[2] = ReadU32LE(p + 20);
+    pt.rgba_channels[3] = ReadU32LE(p + 24);
+    pt.rgba = pt.rgba_channels[0];
     pts.push_back(pt);
   }
   result.points = std::move(pts);
@@ -225,11 +234,31 @@ bool ParseOdomWithLayout(const std::uint8_t* data, std::size_t len,
     return false;
   }
 
+  if (!ValidQuaternionOrder(config.odom_quaternion_order)) {
+    result.reason = MakeReason("odom_quaternion_order must be 'xyzw' or 'wxyz'");
+    return false;
+  }
   const double sq = config.odom_quaternion_scale;
-  const double qx = static_cast<double>(ReadI64LE(data + layout.x_at + 24)) * sq;
-  const double qy = static_cast<double>(ReadI64LE(data + layout.x_at + 32)) * sq;
-  const double qz = static_cast<double>(ReadI64LE(data + layout.x_at + 40)) * sq;
-  const double qw = static_cast<double>(ReadI64LE(data + layout.x_at + 48)) * sq;
+  const double raw0 =
+      static_cast<double>(ReadI64LE(data + layout.x_at + 24)) * sq;
+  const double raw1 =
+      static_cast<double>(ReadI64LE(data + layout.x_at + 32)) * sq;
+  const double raw2 =
+      static_cast<double>(ReadI64LE(data + layout.x_at + 40)) * sq;
+  const double raw3 =
+      static_cast<double>(ReadI64LE(data + layout.x_at + 48)) * sq;
+  double qx = 0.0, qy = 0.0, qz = 0.0, qw = 0.0;
+  if (config.odom_quaternion_order == "wxyz") {
+    qw = raw0;
+    qx = raw1;
+    qy = raw2;
+    qz = raw3;
+  } else {  // "xyzw"
+    qx = raw0;
+    qy = raw1;
+    qz = raw2;
+    qw = raw3;
+  }
   const double norm = std::sqrt(qx * qx + qy * qy + qz * qz + qw * qw);
   if (!std::isfinite(norm) || norm == 0.0) {
     result.reason = MakeReason("odometry quaternion norm is zero");

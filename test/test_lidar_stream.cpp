@@ -315,6 +315,21 @@ TEST(LidarStreamOdometry, TruncationNeverCrashes) {
   }
 }
 
+TEST(LidarStreamOdometry, ParsesQuaternionWxyzOrder) {
+  // When the packet stores w,x,y,z order, the raw sequence is
+  // (1000000, 0, 0, 0) -> w=1, x=y=z=0 after the wxyz mapping.
+  const auto packet =
+      MakeOdometry(OdomLayout::Packed, 1ULL, 0, 0, 0, 1000000, 0, 0, 0);
+  LidarParseConfig cfg;
+  cfg.odom_quaternion_order = "wxyz";
+  const auto r = ParseOdometryPacket(packet.data(), packet.size(), cfg);
+  ASSERT_TRUE(r.ok) << r.reason;
+  EXPECT_DOUBLE_EQ(r.odometry.qw, 1.0);
+  EXPECT_DOUBLE_EQ(r.odometry.qx, 0.0);
+  EXPECT_DOUBLE_EQ(r.odometry.qy, 0.0);
+  EXPECT_DOUBLE_EQ(r.odometry.qz, 0.0);
+}
+
 // ---------------------------------------------------------------------------
 // Point-cloud parsing tests.
 // ---------------------------------------------------------------------------
@@ -342,6 +357,26 @@ TEST(LidarStreamCloud, ParsesPackedDynamicN1) {
   EXPECT_FLOAT_EQ(r.points[0].x, 1.0f);
   EXPECT_FLOAT_EQ(r.points[0].y, static_cast<float>(1000 * 1e-3));
   EXPECT_EQ(r.points[0].rgba, 0x335577FFU);
+}
+
+TEST(LidarStreamCloud, PreservesAllFourRgbaChannels) {
+  auto packet = MakeCloud(
+      CloudLayout::Packed, TailStyle::Dynamic, 7ULL, 50, 0, 1, MkPts(1, 1000));
+  // 28-byte point record: first point begins at offset 20 (packed header).
+  const std::size_t point_off = 20U;
+  PutU32(packet, point_off + 12U, 0x11223344U);
+  PutU32(packet, point_off + 16U, 0x55667788U);
+  PutU32(packet, point_off + 20U, 0x99AABBCCU);
+  PutU32(packet, point_off + 24U, 0xDDEEFF00U);
+  const auto r =
+      ParsePointCloudPacket(packet.data(), packet.size(), DefaultConfig());
+  ASSERT_TRUE(r.ok) << r.reason;
+  ASSERT_EQ(r.points.size(), 1U);
+  EXPECT_EQ(r.points[0].rgba, 0x11223344U);
+  EXPECT_EQ(r.points[0].rgba_channels[0], 0x11223344U);
+  EXPECT_EQ(r.points[0].rgba_channels[1], 0x55667788U);
+  EXPECT_EQ(r.points[0].rgba_channels[2], 0x99AABBCCU);
+  EXPECT_EQ(r.points[0].rgba_channels[3], 0xDDEEFF00U);
 }
 
 TEST(LidarStreamCloud, ParsesPackedDynamicN5And50) {

@@ -242,8 +242,10 @@ ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.2}, angul
 ### 阶段 E：建图（SLAM 骨架）
 
 ```bash
-# 标定 base_link→lidar 外参并回填 config/laserscan_converter.yaml 后：
-ros2 launch hypertron_ros2_bridge mapping.launch.py enable_tf_skeleton:=true
+# 标定 lidar→base_link 外参并回填 config/laserscan_converter.yaml 后：
+# 若使用 /odom_lidar 作为里程计 TF，还需要 enable_odom_tf:=true
+ros2 launch hypertron_ros2_bridge mapping.launch.py \
+  enable_tf_skeleton:=true enable_odom_tf:=true
 ```
 
 > ⚠️ `enable_tf_skeleton` 默认 **false**；其静态 TF 参数为占位值
@@ -254,10 +256,16 @@ ros2 launch hypertron_ros2_bridge mapping.launch.py enable_tf_skeleton:=true
 ### 阶段 F：导航（Nav2 骨架）
 
 ```bash
-ros2 launch hypertron_ros2_bridge navigation.launch.py map:=<绝对路径>/map.yaml
+# 独立导航：map_server + AMCL
+ros2 launch hypertron_ros2_bridge navigation.launch.py \
+  map:=<绝对路径>/map.yaml use_amcl:=true
+
+# 配合 mapping.launch 在线 SLAM 定位
+ros2 launch hypertron_ros2_bridge navigation.launch.py use_amcl:=false
 ```
 
-（需同时运行 mapping.launch 由 SLAM 提供 map→odom 定位，或后续加 AMCL。）
+（独立导航需要标定后的 odom→base_link TF；在线 SLAM 需要同时运行
+mapping.launch 提供 map→odom 定位。）
 低速验收：点到点、避障、断流时导航感知超时（Nav2 应停，而不是用陈旧数据）。
 
 ### 紧急情况
@@ -277,28 +285,28 @@ ros2 launch hypertron_ros2_bridge navigation.launch.py map:=<绝对路径>/map.y
 1. **UDP 6100 字段语义未证实**：当前解析把 offset 10 当作“帧总点数”、
    offset 14 当作“包序号”；手册笔记写的是“帧序号、数据序号”。若实机
    offset 10 是帧序号，现有组帧算法将无法发布 `/points`。
-2. **UDP 6100 RGBA 只保留 4 字节**：手册笔记描述单点为 3×int32 + 4×uint32
-   RGBA，而 `lidar_stream.hpp` 只保留第一个 uint32，其余 12 字节被当作
-   padding。需按真实结构和点云用途重做颜色/强度映射。
-3. **LiDAR 订阅固定 1 Hz**：`subscribe_lidar()` 内部固定使用 1 Hz；如果 SDK
-   的订阅频率决定 UDP 6100/6101 推送频率，点云将只有 1 Hz，且可能被
-   `frame_timeout_ms=300` 丢弃。需确认后增加可配置频率。
+2. **UDP 6100 RGBA 发布仍只使用第一个 uint32**：解析层已保留全部 4 个
+   uint32 通道（`rgba_channels`），但 `/points` 为兼容 PointXYZRGBA 仍只把
+   第一个通道发布为 `rgba`；如需完整颜色/强度映射，需按真实结构在
+   `driver_node.cpp` 增加扩展字段。
+3. **LiDAR 订阅频率已可配置**：`subscriptions.lidar_frequency_hz` 默认 1 Hz；
+   如果 SDK 的订阅频率决定 UDP 6100/6101 推送频率，实机确认后调高即可。
+   仍需确认该频率与 `frame_timeout_ms=300` 的配合。
 4. **6100/6101 布局与尾部 padding 未证实**：当前只接受精确动态/固定尾长度，
    旧实现曾接受 aligned 尾部 padding；若实机带 padding，需恢复兼容。
-5. **6101 四元数 scale 实际无效**：解析后立即归一化，统一的 scale 被约掉；
-   当前也没有 6101 四元数顺序配置。应删除/澄清 scale 参数，并按实机顺序
-   增加 order 参数。
+5. **6101 四元数顺序已可配置**：新增 `lidar.odom_quaternion_order`（xyzw/wxyz）。
+   `odom_quaternion_scale` 仍会被归一化约掉，需在实机标定时确认是否应删除该参数。
 6. **recover/recovery 在 error_code≠0 时被拒绝**：若 recovery 的目标场景就是
    系统错误后的恢复，该门禁会使其不可用；需按手册确认。
 7. **heartbeat/motion/getter 共用同一 worker**：最坏情况下阻塞型 SDK 调用
    （heartbeat 500ms、无超时的 getter）会中断 20ms 运动刷新并使 stop()
    等待较久。需要 SDK 实测延迟后决定是否拆分线程或收紧超时。
-8. **`max_packets_per_frame` 与 `max_points_per_frame` 不匹配**：默认 4096
-   包 × 50 点只够 204,800 点，而 max_points 默认 2,000,000；启动时会告警，
-   实机点云规模确认后需调整默认值。
-9. **SLAM/Nav2 仍是骨架**：`pointcloud_to_laserscan`、slam_toolbox、Nav2
-   参数均为占位值，且缺少标定后的 odom→base TF 源；阶段 E/F 不能直接得到
-   可用地图/导航。
+8. **`max_packets_per_frame` 默认已调整为 40000**：可组满 2,000,000 点
+   （50 点/包）。实机点云规模确认后仍需按实际值回填。
+9. **SLAM/Nav2 仍是待标定骨架**：已增加 `odom_lidar.publish_tf`、
+   `mapping.launch.py enable_odom_tf` 和 `navigation.launch.py use_amcl`
+   支持，但 `pointcloud_to_laserscan`、slam_toolbox、Nav2 参数仍为占位值，
+   且必须完成外参/里程计标定后才能得到可用地图/导航。
 10. **相机 H.264（UDP 6000）未实现**；`/joint_commands` 恒拒绝、无
     `/joint_states`。
 11. **本版本未做 ROS/SDK 实机构建验证**：修复后需在目标机器重新跑第 6 节

@@ -90,10 +90,11 @@ sudo tcpdump -i eno1 -w /tmp/odom6101.pcap udp port 6101 -c 500
 
 1. 安装缺失依赖（需管理员）：`sudo apt install ros-humble-pointcloud-to-laserscan`
    （robot_localization 可选，后续里程计融合再用）。
-2. 标定 `base_link→lidar` 外参（B8/B10 的轴向 + 结构尺寸），填入
+2. 标定 `lidar→base_link` 外参（B8/B10 的轴向 + 结构尺寸），填入
    `config/laserscan_converter.yaml` 与 TF 骨架参数后启动：
    ```bash
-   ros2 launch hypertron_ros2_bridge mapping.launch.py enable_tf_skeleton:=true
+   ros2 launch hypertron_ros2_bridge mapping.launch.py \
+     enable_tf_skeleton:=true enable_odom_tf:=true
    ```
 3. 低速推/遥操作覆盖环境建图，保存地图，静止漂移与地图一致性验收。
 4. **骨架中的 TF 参数默认是占位值（0,0,0,0,0,0），未标定前禁止开启

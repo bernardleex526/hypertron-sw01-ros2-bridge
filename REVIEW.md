@@ -47,11 +47,19 @@
 以及 ROS 图命令（`ros2 topic list` 等）在目标环境验证。eno1 当前无载波
 （网线未接/机器人未开），全部实机步骤待做。
 
-### 本轮修复后的重新验证 — 未进行
+### 本轮修复后的重新验证 — 已完成本地验证
 本轮修复了 frames 参数失效、模式切换 promise 悬挂/覆盖、robot_state 竞态、
-模式切换前零速、CMake 环境变量、无效 scan remap 等问题，并删除了退役 HTBR
-代码。**尚未在 ROS 2 + ASTRALL SDK 环境重新构建和运行全部测试**；合并后必须
-先完成 README 第 6 节验证。
+模式切换前零速、CMake 环境变量、无效 scan remap、`test_thread_safe_queue`
+缺少 include 目录等问题，并删除了退役 HTBR 代码。另新增：
+- LiDAR 解析保留全部 4 个 RGBA 通道；
+- 6101 四元数顺序可配置；
+- LiDAR 订阅频率可配置；
+- `max_packets_per_frame` 默认调整至 40000；
+- `odom_lidar.publish_tf` 与 `mapping.launch.py enable_odom_tf`；
+- `navigation.launch.py use_amcl` 支持 map_server + AMCL。
+
+已在 ROS 2 Humble + ASTRALL SDK 环境重新构建，纯 CMake 5/5、ROS CTest 9/9
+通过。
 
 ### ThreadSanitizer — 建议抽查
 建议用 `setarch -R`（关闭 ASLR）重跑 TSAN 抽查并发路径；上一轮曾观察到 WSL
