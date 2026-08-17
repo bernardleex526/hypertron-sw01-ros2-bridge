@@ -309,6 +309,13 @@ void DirectDriverRuntime::worker_main() {
       continue;
     }
 
+    // stop() may have arrived while the (bounded, but still blocking)
+    // preflight command was running. Do not start a 60-second SDK init if
+    // shutdown was requested in the meantime.
+    if (stopping()) {
+      return;
+    }
+
     // A status callback received from here on (including one delivered
     // synchronously inside init or during the subscriptions) belongs to
     // this connection attempt: the link-drop latch must not carry over
@@ -390,7 +397,6 @@ void DirectDriverRuntime::run_connected_loop() {
   IMonotonicClock::time_point next_motion_refresh =
       session_start + config_.motion_refresh_period;
   // A fresh session knows no commanded velocity, so no zero move is due.
-  last_sent_velocity_ = {};
   last_sent_nonzero_ = false;
 
   while (true) {
@@ -452,6 +458,16 @@ void DirectDriverRuntime::run_connected_loop() {
     // The emergency stop takes priority over every queued command, so it is
     // processed before anything is dequeued.
     handle_estop_if_requested();
+    // A status callback (authority loss / system error) may have cleared the
+    // controller-side transition while the worker-side ModeTransition was
+    // still armed. Settle that orphan before any newer command can overwrite
+    // its promise.
+    if (mode_transition_.active && !controller_.mode_transition_pending()) {
+      fail_mode_transition(
+          Result::failure(kSdkResFailed,
+                          "mode transition aborted by the safety gate"),
+          true);
+    }
     const std::optional<Command> command = command_queue_.try_pop();
     if (command.has_value()) {
       execute_command(*command);
@@ -505,7 +521,6 @@ void DirectDriverRuntime::run_connected_loop() {
                        "velocity move rejected by the SDK: " +
                            move_result.message);
         } else {
-          last_sent_velocity_ = target;
           last_sent_nonzero_ = target_nonzero;
         }
       }
@@ -533,6 +548,15 @@ void DirectDriverRuntime::run_connected_loop() {
         controller_.update_robot_state(
             ControllerStatus{sdk_linked_, control_authority_,
                              snapshot.sport_status, snapshot.error_code});
+      }
+      // If the just-applied controller status cleared the controller-side
+      // transition, settle the worker-side transition now instead of ever
+      // reporting success for a transition the safety gate already dropped.
+      if (mode_transition_.active && !controller_.mode_transition_pending()) {
+        fail_mode_transition(
+            Result::failure(kSdkResFailed,
+                            "mode transition aborted by the safety gate"),
+            true);
       }
       // The driver readiness gate re-arms only on the first snapshot of
       // this connection that reports an SDK link; a fresh session never
@@ -678,6 +702,37 @@ void DirectDriverRuntime::execute_command(const Command& command) {
       return;
     }
 
+    // Never overwrite a still-armed worker-side transition: resolve its
+    // promise first. The controller already owns the newer request, so the
+    // controller transition state must not be completed here.
+    if (mode_transition_.active) {
+      fail_mode_transition(
+          Result::failure(kSdkResFailed,
+                          "mode transition superseded by a newer mode command"),
+          false);
+    }
+
+    // If the robot was moving, send one explicit zero before switching mode.
+    // The controller already cleared the latest velocity locally, but the
+    // SDK still has the previous nonzero command until the next motion tick;
+    // waiting for that tick after set_mode would leave a window where the
+    // mode changes while the old velocity may still be in effect.
+    if (last_sent_nonzero_) {
+      const Result zero_result =
+          sdk_->move(Velocity{}, config_.sdk_call_timeout_ms);
+      if (!zero_result.success()) {
+        controller_.complete_mode_transition(false);
+        set_promise(
+            command.promise,
+            Result::failure(
+                zero_result.code,
+                "zero-velocity before mode switch failed: " +
+                    zero_result.message));
+        return;
+      }
+      last_sent_nonzero_ = false;
+    }
+
     const Result set_result =
         sdk_->set_mode(command.mode, config_.sdk_call_timeout_ms);
     if (!set_result.success()) {
@@ -738,6 +793,15 @@ void DirectDriverRuntime::check_mode_transition(
   if (!mode_transition_.active) {
     return;
   }
+  // Success is only meaningful while the controller still owns the same
+  // pending transition; otherwise a safety-gate update already dropped it.
+  if (!controller_.mode_transition_pending()) {
+    fail_mode_transition(
+        Result::failure(kSdkResFailed,
+                        "mode transition aborted by the safety gate"),
+        false);
+    return;
+  }
   if (snapshot.sport_status == mode_transition_.stable_status) {
     const auto promise = mode_transition_.promise;
     mode_transition_.active = false;
@@ -761,6 +825,19 @@ void DirectDriverRuntime::settle_mode_transition_timeout() {
                               "the stable sport status"));
 }
 
+void DirectDriverRuntime::fail_mode_transition(const Result& result,
+                                               bool complete_controller) {
+  if (!mode_transition_.active) {
+    return;
+  }
+  const auto promise = mode_transition_.promise;
+  mode_transition_.active = false;
+  if (complete_controller) {
+    controller_.complete_mode_transition(false);
+  }
+  set_promise(promise, result);
+}
+
 void DirectDriverRuntime::handle_estop_if_requested() {
   std::shared_ptr<std::promise<Result>> promise;
   {
@@ -775,14 +852,10 @@ void DirectDriverRuntime::handle_estop_if_requested() {
 
   // Clear every pending command and the in-flight mode transition so motion
   // cannot resume through a stale request once the latch is lifted.
-  if (mode_transition_.active) {
-    const auto transition_promise = mode_transition_.promise;
-    mode_transition_.active = false;
-    set_promise(transition_promise,
-                Result::failure(kSdkResFailed,
-                                "mode transition aborted by the emergency "
-                                "stop"));
-  }
+  fail_mode_transition(
+      Result::failure(kSdkResFailed,
+                      "mode transition aborted by the emergency stop"),
+      false);
   controller_.complete_mode_transition(false);
   std::optional<Command> command;
   while ((command = command_queue_.try_pop()).has_value()) {
@@ -837,8 +910,11 @@ bool DirectDriverRuntime::send_zero_and_damping() {
     notify_event(kRuntimeEventWarning,
                  "damping mode command failed: " + mode_result.message);
   }
-  last_sent_velocity_ = {};
-  last_sent_nonzero_ = false;
+  // Keep last_sent_nonzero_ set when the zero move failed: the normal motion
+  // tick then retries the stop zero instead of silently giving up.
+  if (move_result.success()) {
+    last_sent_nonzero_ = false;
+  }
   return move_result.success() && mode_result.success();
 }
 
@@ -875,11 +951,10 @@ void DirectDriverRuntime::fail_all_pending_locked() {
     }
   }
   if (mode_transition_.active) {
-    const auto promise = mode_transition_.promise;
-    mode_transition_.active = false;
-    set_promise(promise,
-                Result::failure(kSdkResNotInit,
-                                "connection lost during a mode transition"));
+    fail_mode_transition(
+        Result::failure(kSdkResNotInit,
+                        "connection lost during a mode transition"),
+        false);
   }
   std::optional<Command> command;
   while ((command = command_queue_.try_pop()).has_value()) {

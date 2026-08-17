@@ -4,11 +4,17 @@ project(hypertron_ros2_bridge VERSION 0.1.0 LANGUAGES C CXX)
 option(BUILD_ROS2_BRIDGE "Build the PC-side direct ASTRALL ROS2 driver node" ON)
 
 # Vendor SDK location. Defaults to the documented commissioning-host
-# installation; override with -DASTRALL_SDK_ROOT=... (or the
-# ASTRALL_SDK_ROOT environment variable) elsewhere. Must provide
-# include/interface.h and lib/linux/x86_64/libASTRALL_SDK.so.
-set(ASTRALL_SDK_ROOT "/home/lee/zkyd/xuanji/ASTRALL_SDK_1.0.7/C++"
-  CACHE PATH "ASTRALL SDK 1.0.7 C++ root directory")
+# installation. On a fresh configure the ASTRALL_SDK_ROOT environment
+# variable is honored; -DASTRALL_SDK_ROOT=... takes precedence and a
+# previously cached value remains sticky. Must provide include/interface.h
+# and lib/linux/x86_64/libASTRALL_SDK.so.
+if(DEFINED ENV{ASTRALL_SDK_ROOT})
+  set(ASTRALL_SDK_ROOT "$ENV{ASTRALL_SDK_ROOT}"
+    CACHE PATH "ASTRALL SDK 1.0.7 C++ root directory")
+else()
+  set(ASTRALL_SDK_ROOT "/home/lee/zkyd/xuanji/ASTRALL_SDK_1.0.7/C++"
+    CACHE PATH "ASTRALL SDK 1.0.7 C++ root directory")
+endif()
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -20,12 +26,12 @@ install(FILES README.md SW01_MANUAL_NOTES.md REVIEW.md LICENSE
 include(CTest)
 find_package(Threads REQUIRED)
 
-# Pure core retained for the direct driver: protocol value types,
-# RobotController safety logic, and telemetry mapping.
-add_library(hypertron_protocol STATIC
-  src/protocol_handler.cpp
+# Pure safety controller retained for the direct driver. The retired HTBR
+# protocol codec has been removed; controller-owned value types now live in
+# robot_controller.hpp.
+add_library(hypertron_controller STATIC
   src/robot_controller.cpp)
-target_include_directories(hypertron_protocol PUBLIC
+target_include_directories(hypertron_controller PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 
@@ -46,7 +52,7 @@ target_include_directories(hypertron_direct_runtime PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(hypertron_direct_runtime PUBLIC
-  hypertron_protocol Threads::Threads)
+  hypertron_controller Threads::Threads)
 
 # Pure SW01 LiDAR stream library: parsing and bounded frame reassembly for
 # the AstrallPosCloudData (UDP 6100 point cloud) and AstrallOdometryData
@@ -63,17 +69,12 @@ if(BUILD_TESTING)
 
   add_executable(test_thread_safe_queue test/test_thread_safe_queue.cpp)
   target_link_libraries(test_thread_safe_queue PRIVATE
-    hypertron_protocol GTest::gtest_main Threads::Threads)
+    GTest::gtest_main Threads::Threads)
   add_test(NAME thread_safe_queue COMMAND test_thread_safe_queue)
-
-  add_executable(test_protocol_handler test/test_protocol_handler.cpp)
-  target_link_libraries(test_protocol_handler PRIVATE
-    hypertron_protocol GTest::gtest_main Threads::Threads)
-  add_test(NAME protocol_handler COMMAND test_protocol_handler)
 
   add_executable(test_robot_controller test/test_robot_controller.cpp)
   target_link_libraries(test_robot_controller PRIVATE
-    hypertron_protocol GTest::gtest_main Threads::Threads)
+    hypertron_controller GTest::gtest_main Threads::Threads)
   add_test(NAME robot_controller COMMAND test_robot_controller)
 
   add_executable(test_network_preflight test/test_network_preflight.cpp)
@@ -99,6 +100,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_lidar_stream PRIVATE
     hypertron_lidar_stream GTest::gtest_main Threads::Threads)
   add_test(NAME lidar_stream COMMAND test_lidar_stream)
+
+  # A hung worker in any test must fail CTest instead of blocking the whole
+  # suite forever.
+  set_tests_properties(thread_safe_queue robot_controller network_preflight
+    direct_driver_runtime lidar_stream PROPERTIES TIMEOUT 300)
 endif()
 
 if(BUILD_ROS2_BRIDGE)
@@ -129,6 +135,7 @@ if(BUILD_ROS2_BRIDGE)
   find_package(sensor_msgs REQUIRED)
   find_package(std_msgs REQUIRED)
   find_package(std_srvs REQUIRED)
+  find_package(tf2_msgs REQUIRED)
   find_package(tf2_ros REQUIRED)
 
   rosidl_generate_interfaces(${PROJECT_NAME}
@@ -192,18 +199,18 @@ if(BUILD_ROS2_BRIDGE)
   # /robot_state out; /emergency_stop and /control_authority services). The
   # vendor library stays a real DT_NEEDED dependency of the produced ELF
   # because the executable links it directly with --no-as-needed, so the link
-  # contract stays verifiable. The vendor include directory stays PRIVATE so
-  # it never leaks into the ROS node sources.
+  # contract stays verifiable. The node sources never receive the vendor
+  # include directory: only hypertron_direct_core may include interface.h.
   add_executable(hypertron_driver_node
     src/driver_main.cpp
     src/driver_node.cpp)
   target_include_directories(hypertron_driver_node PRIVATE
-    "${ASTRALL_INCLUDE_DIR}"
     ${geometry_msgs_INCLUDE_DIRS}
     ${nav_msgs_INCLUDE_DIRS}
     ${sensor_msgs_INCLUDE_DIRS}
     ${std_msgs_INCLUDE_DIRS}
     ${std_srvs_INCLUDE_DIRS}
+    ${tf2_msgs_INCLUDE_DIRS}
     ${tf2_ros_INCLUDE_DIRS})
   target_link_options(hypertron_driver_node PRIVATE "-Wl,--no-as-needed")
   target_link_libraries(hypertron_driver_node PRIVATE
@@ -264,7 +271,10 @@ if(BUILD_ROS2_BRIDGE)
       BUILD_RPATH "${CMAKE_BINARY_DIR}")
     add_test(NAME driver_node COMMAND test_driver_node)
     set_tests_properties(driver_node PROPERTIES
-      ENVIRONMENT "LD_LIBRARY_PATH=$ENV{LD_LIBRARY_PATH}:${CMAKE_BINARY_DIR}")
+      ENVIRONMENT "LD_LIBRARY_PATH=$ENV{LD_LIBRARY_PATH}:${CMAKE_BINARY_DIR}"
+      TIMEOUT 600)
+    set_tests_properties(astrall_sdk direct_astrall_sdk
+      PROPERTIES TIMEOUT 300)
   endif()
 
   install(TARGETS hypertron_driver_node hypertron_direct_core
@@ -278,7 +288,7 @@ if(BUILD_ROS2_BRIDGE)
     DESTINATION include)
 
   ament_export_dependencies(rosidl_default_runtime rclcpp geometry_msgs
-    nav_msgs sensor_msgs std_msgs std_srvs tf2_ros)
+    nav_msgs sensor_msgs std_msgs std_srvs tf2_msgs tf2_ros)
   ament_package()
 
   message(STATUS "ASTRALL SDK x86_64: ${ASTRALL_LIBRARY}")

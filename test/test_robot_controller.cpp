@@ -117,11 +117,9 @@ TEST(RobotController, AuthorityLossAndFaultForceZero) {
             BridgeError::RobotSystemError);
 }
 
-TEST(RobotController, JointPlaceholderRejectsWithoutCommand) {
+TEST(RobotController, JointInterfaceIsUnavailable) {
   ManualClock clock;
   RobotController controller({100ms}, clock);
-  EXPECT_FALSE(controller.reject_joint_command("vendor SDK unavailable"));
-  EXPECT_EQ(controller.rejected_joint_commands(), 1U);
   EXPECT_FALSE(controller.joint_interface_available());
 }
 

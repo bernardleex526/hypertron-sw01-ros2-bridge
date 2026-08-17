@@ -63,9 +63,10 @@ def generate_launch_description() -> LaunchDescription:
         ),
 
         # ------------------------------------------------------------------
-        # pointcloud_to_laserscan：/points + /odom_lidar → /scan
-        # 订阅默认 /cloud_in，输出默认 /scan。显式 remap：/cloud_in←/points
-        # （Humble 实际 topic 名，已从源码确认）
+        # pointcloud_to_laserscan：/points → /scan
+        # Humble 节点订阅 topic 名为 /cloud_in，发布 topic 名为 /scan；
+        # 因此只需要把输入 /cloud_in 重映射到本驱动的 /points，输出无需
+        # remap（不存在 /scan_out 这个 topic）。
         # ------------------------------------------------------------------
         Node(
             package='pointcloud_to_laserscan',
@@ -77,7 +78,6 @@ def generate_launch_description() -> LaunchDescription:
             ],
             remappings=[
                 ('/cloud_in', '/points'),
-                ('/scan_out', '/scan'),
             ],
         ),
 

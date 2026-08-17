@@ -183,18 +183,6 @@ void RobotController::update_robot_state(const ControllerStatus& state) {
   }
 }
 
-bool RobotController::reject_joint_command(std::string_view reason) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  ++rejected_joint_commands_;
-  last_joint_rejection_ = std::string(reason);
-  return false;
-}
-
-std::uint32_t RobotController::rejected_joint_commands() const {
-  std::lock_guard<std::mutex> lock(mutex_);
-  return rejected_joint_commands_;
-}
-
 bool RobotController::emergency_stop_latched() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return estop_latched_;

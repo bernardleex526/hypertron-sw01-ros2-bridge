@@ -34,6 +34,9 @@
 #include <utility>
 #include <vector>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+
 #include <geometry_msgs/msg/twist.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/exceptions.hpp>
@@ -81,6 +84,11 @@ std::string trimmed_lower(const std::string& in) {
 
 bool finite_float(float v) { return std::isfinite(v); }
 
+bool valid_ipv4(const std::string& value) {
+  in_addr addr{};
+  return inet_pton(AF_INET, value.c_str(), &addr) == 1;
+}
+
 }  // namespace
 
 struct HypertronDriverNode::Impl {
@@ -116,6 +124,10 @@ struct HypertronDriverNode::Impl {
     // order within construction does not matter for safety but starting them
     // last means a bind failure never gates the SDK session.
     start_receivers();
+    // Publish one initial state immediately so `ros2 topic echo
+    // /robot_state --once` never blocks forever while the node is still
+    // preflighting/retrying without an SDK session.
+    publish_robot_state();
   }
 
   ~Impl() {
@@ -142,8 +154,10 @@ struct HypertronDriverNode::Impl {
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       snapshot_ = snapshot;
-      status_linked_ = snapshot.sdk_linked;
-      status_authority_ = snapshot.control_authority;
+      // status_linked_ / status_authority_ are owned exclusively by
+      // on_status(). A snapshot may have been taken before a newer status
+      // callback ran, so copying those two fields here could publish a
+      // stale "still linked / still authorized" robot_state.
     }
     publish_robot_state();
     if (tf_broadcaster_ && last_pose_indicator()) {
@@ -209,6 +223,15 @@ struct HypertronDriverNode::Impl {
   }
 
   void on_sport(const SportSample& sample) {
+    for (float value : sample.wheel_speed) {
+      if (!finite_float(value)) {
+        update_last_error(
+            "dropped sport sample: wheel speed contained a non-finite value");
+        RCLCPP_WARN_THROTTLE(node.get_logger(), *node.get_clock(), 1000,
+                             "Dropped sport sample: non-finite wheel speed");
+        return;
+      }
+    }
     std::lock_guard<std::mutex> lock(state_mutex_);
     snapshot_.wheel_speed = sample.wheel_speed;
   }
@@ -223,6 +246,12 @@ struct HypertronDriverNode::Impl {
         changed = true;
       }
     }
+    // Never let a stale odom->base TF from the previous session survive a
+    // reported link loss.
+    if (!linked) {
+      std::lock_guard<std::mutex> pose_lock(pose_mutex_);
+      last_pose_.reset();
+    }
     if (changed) {
       publish_robot_state();
     }
@@ -231,6 +260,10 @@ struct HypertronDriverNode::Impl {
   void on_event(int severity, std::string message) {
     if (severity >= kRuntimeEventWarning) {
       update_last_error_owned(message);
+      // Runtime warnings/errors often happen while disconnected (preflight
+      // and SDK retries), when no state poll is running. Publish immediately
+      // so /robot_state.last_error stays observable.
+      publish_robot_state();
     }
     switch (severity) {
       case kRuntimeEventError:
@@ -261,7 +294,6 @@ struct HypertronDriverNode::Impl {
     // rejection. The public /cmd_vel callback must never submit a NaN/Inf.
     if (!std::isfinite(msg->linear.x) || !std::isfinite(msg->linear.y) ||
         !std::isfinite(msg->angular.z)) {
-      rejected_nonfinite_cmd_vel_.fetch_add(1, std::memory_order_relaxed);
       RCLCPP_WARN_THROTTLE(
           node.get_logger(), *node.get_clock(), 1000,
           "Rejected /cmd_vel with non-finite component (linear.x=%g "
@@ -452,14 +484,35 @@ struct HypertronDriverNode::Impl {
       throw rclcpp::exceptions::InvalidParametersException(message);
     };
 
-    // Ports within [1, 65535].
-    for (const char* p :
-         {"lidar.point_cloud_port", "lidar.odometry_port"}) {
-      const int port = node.get_parameter(p).as_int();
-      if (port < 1 || port > 65535) {
-        fail(std::string(p) + "=" + std::to_string(port) +
-             " is outside the valid port range [1, 65535]");
-      }
+    // Ports within [1, 65535] and distinct: sharing one UDP port between
+    // the two receivers silently splits datagrams between sockets.
+    const int point_cloud_port =
+        node.get_parameter("lidar.point_cloud_port").as_int();
+    const int odometry_port =
+        node.get_parameter("lidar.odometry_port").as_int();
+    if (point_cloud_port < 1 || point_cloud_port > 65535) {
+      fail("lidar.point_cloud_port=" + std::to_string(point_cloud_port) +
+           " is outside the valid port range [1, 65535]");
+    }
+    if (odometry_port < 1 || odometry_port > 65535) {
+      fail("lidar.odometry_port=" + std::to_string(odometry_port) +
+           " is outside the valid port range [1, 65535]");
+    }
+    if (point_cloud_port == odometry_port) {
+      fail("lidar.point_cloud_port and lidar.odometry_port must differ");
+    }
+
+    // Bind/source addresses are validated here instead of degrading to a
+    // permanently disabled stream or an all-dropped filter at runtime.
+    const std::string bind_ip =
+        node.get_parameter("lidar.bind_ip").as_string();
+    if (!valid_ipv4(bind_ip)) {
+      fail("lidar.bind_ip='" + bind_ip + "' is not a valid IPv4 address");
+    }
+    const std::string source_ip =
+        node.get_parameter("lidar.source_ip").as_string();
+    if (!source_ip.empty() && !valid_ipv4(source_ip)) {
+      fail("lidar.source_ip='" + source_ip + "' is not a valid IPv4 address");
     }
 
     // Every *_ms timing / timeout must be strictly positive.
@@ -502,6 +555,25 @@ struct HypertronDriverNode::Impl {
       fail("lidar.max_packets_per_frame=" + std::to_string(max_packets) +
            " is outside [1, 65536]");
     }
+    // Bound the total in-flight point budget so a malformed/hostile stream
+    // cannot make the assembler allocate tens of gigabytes through valid
+    // parameter combinations.
+    const std::int64_t total_point_budget =
+        static_cast<std::int64_t>(max_parallel) *
+        static_cast<std::int64_t>(max_points);
+    if (total_point_budget > 20000000LL) {
+      fail("lidar.max_parallel_frames * lidar.max_points_per_frame = " +
+           std::to_string(total_point_budget) +
+           " exceeds the 20,000,000 point memory budget");
+    }
+    if (max_packets < (max_points + 49) / 50) {
+      RCLCPP_WARN_THROTTLE(
+          node.get_logger(), *node.get_clock(), 60000,
+          "lidar.max_packets_per_frame=%d cannot address the configured "
+          "lidar.max_points_per_frame=%d points (at most 50 points per "
+          "packet); frames larger than %d packets can never be reassembled",
+          max_packets, max_points, max_packets);
+    }
 
     // Scale coefficients: finite and within (0, 1e9].
     for (const char* p :
@@ -533,6 +605,29 @@ struct HypertronDriverNode::Impl {
            std::to_string(reconnect_max) + ")");
     }
 
+    const int motion_refresh_ms =
+        node.get_parameter("timing.motion_refresh_period_ms").as_int();
+    const int command_deadman_ms =
+        node.get_parameter("safety.command_deadman_ms").as_int();
+    if (motion_refresh_ms > command_deadman_ms) {
+      RCLCPP_WARN_THROTTLE(
+          node.get_logger(), *node.get_clock(), 60000,
+          "timing.motion_refresh_period_ms=%d exceeds "
+          "safety.command_deadman_ms=%d; accepted velocities will expire "
+          "before the worker can send them",
+          motion_refresh_ms, command_deadman_ms);
+    }
+    const int heartbeat_call_timeout_ms =
+        node.get_parameter("sdk.heartbeat_call_timeout_ms").as_int();
+    if (heartbeat_call_timeout_ms >= 500) {
+      RCLCPP_WARN_THROTTLE(
+          node.get_logger(), *node.get_clock(), 60000,
+          "sdk.heartbeat_call_timeout_ms=%d is at or beyond the robot's "
+          "documented ~500 ms heartbeat-loss threshold; motion refresh may "
+          "be interrupted while the worker is blocked in heartbeat()",
+          heartbeat_call_timeout_ms);
+    }
+
     const std::string robot_address =
         node.get_parameter("robot_address").as_string();
     if (robot_address != "10.18.0.100") {
@@ -559,6 +654,15 @@ struct HypertronDriverNode::Impl {
       throw rclcpp::exceptions::InvalidParametersException(
           "imu.quaternion_order='" + order +
           "' is not 'xyzw' or 'wxyz'");
+    }
+
+    // The frame-name parameters were previously declared but never read;
+    // apply them so config/driver_config.yaml is effective.
+    frames_.imu = node.get_parameter("frames.imu").as_string();
+    frames_.odom = node.get_parameter("frames.odom").as_string();
+    frames_.base = node.get_parameter("frames.base").as_string();
+    if (frames_.imu.empty() || frames_.odom.empty() || frames_.base.empty()) {
+      fail("frame names must not be empty");
     }
 
     orientation_covariance_ =
@@ -685,7 +789,8 @@ struct HypertronDriverNode::Impl {
     odom_pub_ = node.create_publisher<nav_msgs::msg::Odometry>(
         odom_topic, rclcpp::SensorDataQoS());
     robot_state_pub_ = node.create_publisher<RobotStateMsg>(
-        state_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable());
+        state_topic,
+        rclcpp::QoS(rclcpp::KeepLast(10)).reliable().transient_local());
 
     // LiDAR bypass publishers. Created only when the stream is enabled so a
     // disabled node exposes exactly zero lidar publishers and zero receivers.
@@ -847,7 +952,6 @@ struct HypertronDriverNode::Impl {
     msg.point_step = 16U;
     msg.row_step = msg.point_step * msg.width;
 
-    sensor_msgs::msg::PointField field;
     sensor_msgs::msg::PointField x;
     x.name = "x"; x.offset = 0U; x.datatype = sensor_msgs::msg::PointField::FLOAT32; x.count = 1U;
     sensor_msgs::msg::PointField y;
@@ -1009,6 +1113,7 @@ struct HypertronDriverNode::Impl {
       last_error = last_error_;
     }
     msg.header.stamp = node.get_clock()->now();
+    msg.header.frame_id = frames_.base;
     msg.ssh_connected = false;
     msg.agent_connected = false;
     msg.sdk_linked = linked;
@@ -1022,12 +1127,21 @@ struct HypertronDriverNode::Impl {
     msg.error_code = snapshot.error_code;
     msg.warning_code = snapshot.warning_code;
     msg.sport_status = snapshot.sport_status;
-    msg.battery_percentage = snapshot.battery_percentage;
-    msg.battery_temperature = snapshot.battery_temperature;
-    msg.battery_voltage = snapshot.battery_voltage;
+    msg.battery_percentage =
+        finite_float(snapshot.battery_percentage) ? snapshot.battery_percentage
+                                                  : 0.0F;
+    msg.battery_temperature =
+        finite_float(snapshot.battery_temperature) ? snapshot.battery_temperature
+                                                   : 0.0F;
+    msg.battery_voltage =
+        finite_float(snapshot.battery_voltage) ? snapshot.battery_voltage
+                                               : 0.0F;
     msg.battery_cycle_count = snapshot.battery_cycle_count;
     msg.charge_status = snapshot.charge_status;
-    msg.wheel_speed = snapshot.wheel_speed;
+    for (std::size_t i = 0; i < msg.wheel_speed.size(); ++i) {
+      msg.wheel_speed[i] =
+          finite_float(snapshot.wheel_speed[i]) ? snapshot.wheel_speed[i] : 0.0F;
+    }
     msg.protocol_rx_drops = 0;
     msg.rejected_joint_commands =
         rejected_joint_commands_.load(std::memory_order_relaxed);
@@ -1191,7 +1305,6 @@ struct HypertronDriverNode::Impl {
   std::string last_error_;
 
   std::atomic<std::uint32_t> rejected_joint_commands_{0};
-  std::atomic<std::uint32_t> rejected_nonfinite_cmd_vel_{0};
 
   // Latest odometry pose, guarded by pose_mutex_, used for TF.
   std::mutex pose_mutex_;

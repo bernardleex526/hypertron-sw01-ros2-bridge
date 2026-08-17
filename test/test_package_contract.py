@@ -30,7 +30,6 @@ def test_required_artifacts_and_public_contract_exist() -> None:
         "REVIEW.md",
         "msg/RobotState.msg",
         "config/driver_config.yaml",
-        "include/protocol_handler.hpp",
         "include/robot_controller.hpp",
     ]
     assert all((ROOT / path).is_file() for path in required)
@@ -133,7 +132,7 @@ def test_vendor_include_is_unique_to_direct_adapter() -> None:
             for line in path.read_text(encoding="utf-8",
                                        errors="ignore").splitlines():
                 if re.search(r'#\s*include\s*[<"]interface\.h[>"]', line):
-                    hits.append(str(path.relative_to(ROOT)))
+                    hits.append(path.relative_to(ROOT).as_posix())
     assert hits == ["src/direct_astrall_sdk.cpp"], hits
 
 

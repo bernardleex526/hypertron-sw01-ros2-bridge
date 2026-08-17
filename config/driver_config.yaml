@@ -39,6 +39,8 @@ hypertron_driver:
       frame_timeout_ms: 300
       max_parallel_frames: 4
       max_points_per_frame: 2000000
+      # 注意：每包最多 50 点，4096 包只能组 204800 点；若实机单帧超过该
+      # 值，必须调大 max_packets_per_frame（节点启动时会对此告警）。
       max_packets_per_frame: 4096
 
     odom_lidar:

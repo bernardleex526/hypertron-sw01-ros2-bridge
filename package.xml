@@ -15,11 +15,14 @@
   <depend>sensor_msgs</depend>
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
+  <depend>tf2_msgs</depend>
   <depend>tf2_ros</depend>
 
   <exec_depend>rosidl_default_runtime</exec_depend>
 
   <!-- 建图/导航骨架运行依赖 -->
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>pointcloud_to_laserscan</exec_depend>

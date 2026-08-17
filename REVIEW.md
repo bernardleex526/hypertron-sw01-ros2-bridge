@@ -22,14 +22,14 @@
 
 验证矩阵：
 
-- **纯 CMake**（`-DBUILD_ROS2_BRIDGE=OFF`）：6 项 CTest 全部通过
-  （`thread_safe_queue`、`protocol_handler`、`robot_controller`、
-  `network_preflight`、`direct_driver_runtime`（现 41 个用例，含新增
-  `LidarSubscriptionFailureRetriesConnection` 与 `LidarStreamDisabledNeverSubscribes`）、
-  `lidar_stream`）。
-- **ROS**（`-DASTRALL_SDK_ROOT=...`）：ctest 10 项通过
-  （含 `driver_node`，现 13 个用例，含 5 个 LiDAR 新用例）。
-- **pytest 合同**：`test/test_package_contract.py` 13 项全部通过。
+- **纯 CMake**（`-DBUILD_ROS2_BRIDGE=OFF`）：5 项 CTest
+  （`thread_safe_queue`、`robot_controller`、`network_preflight`、
+  `direct_driver_runtime`（45 个用例）、`lidar_stream`）。退役的
+  `protocol_handler`/HTBR 编解码及测试已删除。
+- **ROS**（`-DASTRALL_SDK_ROOT=...`）：9 项 CTest
+  （上述 5 项 + `package_contract` pytest 13 项、`astrall_sdk`、
+  `direct_astrall_sdk`、`driver_node` 15 个用例）。
+- **pytest 合同**：`test/test_package_contract.py` 13 项。
 - **colcon**：`colcon build --packages-select hypertron_ros2_bridge` 通过；
   `ASTRALL_SDK_ROOT` 默认本机 SDK 路径（可覆盖）。
 - **launch 存活冒烟**：无网络（eno1 无载波）下 `ros2 launch
@@ -47,10 +47,15 @@
 以及 ROS 图命令（`ros2 topic list` 等）在目标环境验证。eno1 当前无载波
 （网线未接/机器人未开），全部实机步骤待做。
 
+### 本轮修复后的重新验证 — 未进行
+本轮修复了 frames 参数失效、模式切换 promise 悬挂/覆盖、robot_state 竞态、
+模式切换前零速、CMake 环境变量、无效 scan remap 等问题，并删除了退役 HTBR
+代码。**尚未在 ROS 2 + ASTRALL SDK 环境重新构建和运行全部测试**；合并后必须
+先完成 README 第 6 节验证。
+
 ### ThreadSanitizer — 建议抽查
-之前观察到 WSL 的 TSAN runtime 在测试进程启动前报
-`unexpected memory mapping`（ASLR 兼容问题）。后续建议用
-`setarch -R`（关闭 ASLR）重跑 TSAN 抽查并发路径。
+建议用 `setarch -R`（关闭 ASLR）重跑 TSAN 抽查并发路径；上一轮曾观察到 WSL
+TSAN 的 ASLR 兼容问题。
 
 ### pointcloud_to_laserscan 未安装
 
@@ -71,8 +76,7 @@
 
 ## 提交记录
 
-全部工作（Task 1–7、LiDAR 接入分期 1–4、SLAM/Nav2 骨架、终审修复）以单个
-提交合入并覆盖主分支；旧 SSH/agent 架构历史保存在远端
+直连驱动工作与后续修复提交至主分支；旧 SSH/agent 架构历史保存在远端
 `archive/legacy-ssh-agent` 分支备查。
 
 ## 说明

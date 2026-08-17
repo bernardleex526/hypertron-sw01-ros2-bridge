@@ -1084,6 +1084,49 @@ TEST(DirectDriverRuntime, ModeRequestsAreSerializedAndConfirmed) {
   runtime.stop();
 }
 
+TEST(DirectDriverRuntime, AuthorityLossAbortsModeTransitionAndNextModeIsSafe) {
+  auto sdk = std::make_unique<FakeAstrallSdk>();
+  sdk->set_linked(true);
+  sdk->set_authority(true);
+  sdk->set_sport_status(0xB101U);  // damping: not the requested target
+  auto preflight = std::make_unique<FakeNetworkPreflight>();
+  preflight->next_decision = NetworkDecision{true, "test network ready"};
+  RecordingObserver observer;
+  SteadyMonotonicClock clock;
+  RuntimeConfig config = fast_config();
+
+  FakeAstrallSdk* sdk_ptr = sdk.get();
+  DirectDriverRuntime runtime(std::move(sdk), std::move(preflight), clock,
+                              config, &observer);
+  runtime.start();
+  ASSERT_TRUE(connect_live(runtime, observer, sdk_ptr));
+
+  // Start a transition that will not reach its stable status.
+  std::future<Result> stand = runtime.request_mode("stand");
+  ASSERT_TRUE(wait_until([&] { return recorded_set_mode(sdk_ptr, 0xA102U); }));
+
+  // Authority loss clears the controller-side transition. The worker must
+  // settle the orphaned worker-side transition without leaving its promise
+  // dangling forever.
+  sdk_ptr->emit_status(true, false);
+  ASSERT_EQ(stand.wait_for(2s), std::future_status::ready);
+  const Result stand_result = stand.get();
+  EXPECT_FALSE(stand_result.success());
+  EXPECT_NE(stand_result.message.find("safety gate"), std::string::npos);
+
+  // Regain authority and issue another mode command. The previous runtime
+  // transition is already cleared, so the new promise must not overwrite an
+  // unresolved old one.
+  sdk_ptr->emit_status(true, true);
+  ASSERT_TRUE(observer.wait_for_status(true, true));
+  std::future<Result> down = runtime.request_mode("down");
+  ASSERT_TRUE(wait_until([&] { return recorded_set_mode(sdk_ptr, 0xA103U); }));
+  sdk_ptr->set_sport_status(0xB103U);
+  ASSERT_EQ(down.wait_for(2s), std::future_status::ready);
+  EXPECT_TRUE(down.get().success());
+  runtime.stop();
+}
+
 TEST(DirectDriverRuntime, ModeTransitionTimeoutFailsAndReleasesGate) {
   auto sdk = std::make_unique<FakeAstrallSdk>();
   sdk->set_sport_status(0xB101U);  // never the target

@@ -644,6 +644,14 @@ TEST_F(DriverNodeTest, RobotStateDirectModeFields) {
         received = *msg;
       });
 
+  // Link/authority are owned by on_status() rather than by state snapshots;
+  // emit the SDK status callback before expecting sdk_linked to be true.
+  ASSERT_TRUE(wait_until([&] {
+    executor.spin_some();
+    return h.sdk->was_called("heartbeat");
+  }));
+  h.sdk->emit_status(true, true);
+
   ASSERT_TRUE(wait_until([&] {
     executor.spin_some();
     std::lock_guard<std::mutex> lock(state_mutex);

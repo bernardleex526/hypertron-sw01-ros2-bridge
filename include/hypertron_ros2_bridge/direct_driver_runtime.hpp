@@ -277,6 +277,11 @@ class DirectDriverRuntime {
   // promise with the timeout code. Runs from the connected loop when the
   // transition deadline arrives, independent of the state poll period.
   void settle_mode_transition_timeout();
+  // Fails and clears the worker-side mode transition. When
+  // complete_controller is true the controller transition is completed as a
+  // failure as well; callers that are about to install a newer transition
+  // pass false because the controller already owns the new request.
+  void fail_mode_transition(const Result& result, bool complete_controller);
   // Worker-thread emergency-stop processing, run at the top of every
   // connected-loop iteration so it takes priority over queued commands:
   // fails every queued command and any in-flight mode transition, then -
@@ -374,9 +379,9 @@ class DirectDriverRuntime {
   // state-poll check. Worker-thread only.
   ModeTransition mode_transition_;
 
-  // Latest velocity actually sent to the SDK (worker-thread only), used to
-  // detect the nonzero-to-zero transition that must send one zero move.
-  Velocity last_sent_velocity_{};
+  // True while the latest velocity sent to the SDK was nonzero (worker
+  // thread only). Used to detect the nonzero-to-zero transition that must
+  // send one explicit zero move.
   bool last_sent_nonzero_{false};
   // True once the current connection's first sdk_linked snapshot armed the
   // driver readiness gate; cleared on every session teardown. Worker-thread

@@ -6,9 +6,31 @@
 #include <string>
 #include <string_view>
 
-#include "hypertron_ros2_bridge/protocol_handler.hpp"
-
 namespace hypertron_ros2_bridge {
+
+// Controller-owned protocol value types. These used to live in the retired
+// HTBR protocol handler; the direct driver only needs the safety-relevant
+// subset, so they are defined here to keep the controller dependency-free.
+enum class BridgeError : std::uint16_t {
+  Protocol = 1,
+  FeatureUnavailable = 2,
+  InvalidCommand = 3,
+  Timeout = 4,
+  SdkDisconnected = 5,
+  NoControlAuthority = 6,
+  EmergencyStopLatched = 7,
+  RobotSystemError = 8,
+  SdkCallFailed = 9,
+};
+
+struct VelocityPayload {
+  float vx{};
+  float vy{};
+  float vyaw{};
+  bool operator==(const VelocityPayload& o) const {
+    return vx == o.vx && vy == o.vy && vyaw == o.vyaw;
+  }
+};
 
 class IMonotonicClock {
  public:
@@ -78,8 +100,6 @@ class RobotController {
   void invalidate_connection();
   void update_robot_state(const ControllerStatus& state);
 
-  bool reject_joint_command(std::string_view reason);
-  std::uint32_t rejected_joint_commands() const;
   bool joint_interface_available() const noexcept { return false; }
   bool emergency_stop_latched() const;
   ControllerStatus status() const;
@@ -101,8 +121,6 @@ class RobotController {
   bool motion_transition_gate_{false};
   bool mode_transition_pending_{false};
   std::uint16_t pending_mode_{0};
-  std::uint32_t rejected_joint_commands_{0};
-  std::string last_joint_rejection_;
 };
 
 }  // namespace hypertron_ros2_bridge
