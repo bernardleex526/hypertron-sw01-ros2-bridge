@@ -553,23 +553,23 @@ TEST(LidarStreamReassembly, MultiPacketOutOfOrderPublishesInIndexOrder) {
   EXPECT_FLOAT_EQ(frame->points[2].x, static_cast<float>((2 * 100 + 2) * 1e-3));  // p2 base 2
 }
 
-TEST(LidarStreamReassembly, PublishesWith1BasedIndexes) {
+TEST(LidarStreamReassembly, PublishesWithPointOffsetOutOfOrder) {
   PointCloudFrameAssembler asm_(AssemblerConfig{});
   const std::uint64_t ts = 20;
   const std::uint32_t total = 3;
-  // 1-based index set: 1,2,3.
+  // Point offsets 0,1,2 delivered out of order.
   auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 1, 1, 1).data(),
                                   CloudPacket(ts, total, 1, 1, 1).size(),
-                                  DefaultConfig());
-  auto p3 = ParsePointCloudPacket(CloudPacket(ts, total, 3, 1, 3).data(),
-                                  CloudPacket(ts, total, 3, 1, 3).size(),
                                   DefaultConfig());
   auto p2 = ParsePointCloudPacket(CloudPacket(ts, total, 2, 1, 2).data(),
                                   CloudPacket(ts, total, 2, 1, 2).size(),
                                   DefaultConfig());
+  auto p0 = ParsePointCloudPacket(CloudPacket(ts, total, 0, 1, 0).data(),
+                                  CloudPacket(ts, total, 0, 1, 0).size(),
+                                  DefaultConfig());
   EXPECT_FALSE(asm_.add_packet(p1).has_value());
-  EXPECT_FALSE(asm_.add_packet(p3).has_value());
-  auto frame = asm_.add_packet(p2);
+  EXPECT_FALSE(asm_.add_packet(p2).has_value());
+  auto frame = asm_.add_packet(p0);
   ASSERT_TRUE(frame.has_value());
   ASSERT_EQ(frame->points.size(), 3U);
 }
@@ -720,10 +720,10 @@ TEST(LidarStreamReassembly, StatsCountCorrect) {
 }
 
 // ---------------------------------------------------------------------------
-// F2: Frame completion criterion rewritten per the SW01 manual. `index` is
-// the packet's sequence number within the frame and `total` is the frame's
-// total point count; a frame publishes only when the observed index set
-// covers contiguously from the base (0 or 1) AND the points across the
+// F2: Frame completion criterion based on real SW01 packets. `index` is the
+// starting point offset of the packet within the frame and `total` is the
+// frame's total point count; a frame publishes only when the packet ranges
+// exactly cover [0, total) with no gaps or overlaps AND the points across the
 // observed packets sum to `total`.
 // ---------------------------------------------------------------------------
 
@@ -744,61 +744,46 @@ TEST(LidarStreamReassembly, F2_SinglePacketWhole50PointFramePublishes) {
   EXPECT_EQ(asm_.stats().packets_accepted, 1ULL);
 }
 
-// A single 1-based packet (index=1) carrying the whole frame's points.
-TEST(LidarStreamReassembly, F2_Single1BasedWholeFramePublishes) {
-  PointCloudFrameAssembler asm_(AssemblerConfig{});
-  auto pk = ParsePointCloudPacket(CloudPacket(8, 30, 1, 30, 500).data(),
-                                  CloudPacket(8, 30, 1, 30, 500).size(),
-                                  DefaultConfig());
-  ASSERT_TRUE(pk.ok) << pk.reason;
-  auto frame = asm_.add_packet(pk);
-  ASSERT_TRUE(frame.has_value());
-  EXPECT_EQ(frame->total_points, 30ULL);
-  ASSERT_EQ(frame->points.size(), 30U);
-  EXPECT_EQ(asm_.stats().frames_published, 1ULL);
-}
-
 // Multiple packets each carrying more than one point, delivered out of order,
-// reassemble only when the index set is contiguous and the points sum to the
-// declared total.
-TEST(LidarStreamReassembly, F2_MultiPacketOutOfOrderPosNumGT1Publishes) {
+// reassemble only when the point-offset ranges exactly cover the frame.
+TEST(LidarStreamReassembly, F2_MultiPacketOutOfOrderPointOffsetsPublishes) {
   PointCloudFrameAssembler asm_(AssemblerConfig{});
   const std::uint64_t ts = 55;
   const std::uint32_t total = 50;
-  // index 0 -> 20 points, index 2 -> 10 points (out of order), index 1 -> 20.
+  // offsets 0 -> 20 points, 40 -> 10 points (out of order), 20 -> 20 points.
   auto p0 = ParsePointCloudPacket(CloudPacket(ts, total, 0, 20, 0).data(),
                                   CloudPacket(ts, total, 0, 20, 0).size(),
                                   DefaultConfig());
-  auto p2 = ParsePointCloudPacket(CloudPacket(ts, total, 2, 10, 2).data(),
-                                  CloudPacket(ts, total, 2, 10, 2).size(),
+  auto p2 = ParsePointCloudPacket(CloudPacket(ts, total, 40, 10, 0).data(),
+                                  CloudPacket(ts, total, 40, 10, 0).size(),
                                   DefaultConfig());
-  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 1, 20, 1).data(),
-                                  CloudPacket(ts, total, 1, 20, 1).size(),
+  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 20, 20, 0).data(),
+                                  CloudPacket(ts, total, 20, 20, 0).size(),
                                   DefaultConfig());
   EXPECT_FALSE(asm_.add_packet(p0).has_value());  // 20/50, incomplete
-  EXPECT_FALSE(asm_.add_packet(p2).has_value());  // gap at index 1, 30/50
-  auto frame = asm_.add_packet(p1);               // 50/50 contiguous {0,1,2}
+  EXPECT_FALSE(asm_.add_packet(p2).has_value());  // gap at 20..39, 30/50
+  auto frame = asm_.add_packet(p1);               // 50/50, ranges [0,50)
   ASSERT_TRUE(frame.has_value());
   ASSERT_EQ(frame->points.size(), 50U);
   EXPECT_EQ(frame->total_points, 50ULL);
-  // Index order preserved: packet index 0, then 1, then 2.
+  // Point-offset order preserved: [0,20), [20,40), [40,50).
   EXPECT_FLOAT_EQ(frame->points[0].x, static_cast<float>(0 * 1e-3));
-  EXPECT_FLOAT_EQ(frame->points[20].x, static_cast<float>((1 * 100 + 1) * 1e-3));
-  EXPECT_FLOAT_EQ(frame->points[40].x, static_cast<float>((2 * 100 + 2) * 1e-3));
+  EXPECT_FLOAT_EQ(frame->points[20].x, static_cast<float>(2000 * 1e-3));
+  EXPECT_FLOAT_EQ(frame->points[40].x, static_cast<float>(4000 * 1e-3));
 }
 
 // A multi-packet frame whose last packet carries fewer than 50 points: the
-// frame finishes once the points sum to the declared total.
+// frame finishes once the point ranges sum to the declared total.
 TEST(LidarStreamReassembly, F2_LastPacketUnder50PointsStillPublishes) {
   PointCloudFrameAssembler asm_(AssemblerConfig{});
   const std::uint64_t ts = 60;
   const std::uint32_t total = 50;
   auto p0 = ParsePointCloudPacket(CloudPacket(ts, total, 0, 30, 0).data(),
                                   CloudPacket(ts, total, 0, 30, 0).size(),
-                                  DefaultConfig());  // 30 points
-  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 1, 20, 1).data(),
-                                  CloudPacket(ts, total, 1, 20, 1).size(),
-                                  DefaultConfig());  // 20 points
+                                  DefaultConfig());  // 30 points [0,30)
+  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 30, 20, 0).data(),
+                                  CloudPacket(ts, total, 30, 20, 0).size(),
+                                  DefaultConfig());  // 20 points [30,50)
   EXPECT_FALSE(asm_.add_packet(p0).has_value());
   auto frame = asm_.add_packet(p1);
   ASSERT_TRUE(frame.has_value());
@@ -817,23 +802,22 @@ TEST(LidarStreamReassembly, F2_CumulativePointsExceedTotalDropsFrame) {
   const std::uint32_t total = 30;
   auto p0 = ParsePointCloudPacket(CloudPacket(ts, total, 0, 20, 0).data(),
                                   CloudPacket(ts, total, 0, 20, 0).size(),
-                                  DefaultConfig());  // 20/30
-  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 1, 20, 1).data(),
-                                  CloudPacket(ts, total, 1, 20, 1).size(),
-                                  DefaultConfig());  // would push to 40 > 30
+                                  DefaultConfig());  // [0,20), 20/30
+  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 20, 20, 0).data(),
+                                  CloudPacket(ts, total, 20, 20, 0).size(),
+                                  DefaultConfig());  // [20,40) would push 40 > 30
   EXPECT_FALSE(asm_.add_packet(p0).has_value());
   EXPECT_FALSE(asm_.add_packet(p1).has_value());
   EXPECT_EQ(asm_.stats().frames_dropped_conflict, 1ULL);
   EXPECT_EQ(asm_.in_flight_count(), 0U);
 }
 
-// A sparse index beyond the per-frame packet cap is rejected outright (the
-// frame cannot be completed from the base and memory stays bounded).
-TEST(LidarStreamReassembly, F2_SparseIndexOverCapRejected) {
+// A packet whose offset is outside the declared frame is rejected outright.
+TEST(LidarStreamReassembly, F2_PointOffsetOutsideFrameRejected) {
   AssemblerConfig cfg;
   cfg.max_packets_per_frame = 8;
   PointCloudFrameAssembler asm_(cfg);
-  // index 100 > max_packets_per_frame(8): rejected without allocating.
+  // total=50, offset=100 is outside the frame.
   auto pk = ParsePointCloudPacket(CloudPacket(80, 50, 100, 50, 0).data(),
                                   CloudPacket(80, 50, 100, 50, 0).size(),
                                   DefaultConfig());
@@ -855,6 +839,104 @@ TEST(LidarStreamReassembly, F2_TotalOverMaxPointsPerFrameRejected) {
   EXPECT_FALSE(asm_.add_packet(pk).has_value());
   EXPECT_EQ(asm_.stats().packets_rejected, 1ULL);
   EXPECT_EQ(asm_.in_flight_count(), 0U);
+}
+
+// ---------------------------------------------------------------------------
+// F4: Real SW01 packets use `index` as the starting point offset within the
+// frame (0, 50, 100, ...), not a packet sequence number. A frame is complete
+// when the packet ranges exactly cover [0, total) with no gaps or overlaps.
+// ---------------------------------------------------------------------------
+
+TEST(LidarStreamReassembly, F4_PointOffsetIndicesPublishWhenCoverageComplete) {
+  PointCloudFrameAssembler asm_(AssemblerConfig{});
+  const std::uint64_t ts = 1000;
+  const std::uint32_t total = 100;
+  auto p0 = ParsePointCloudPacket(CloudPacket(ts, total, 0, 50, 0).data(),
+                                  CloudPacket(ts, total, 0, 50, 0).size(),
+                                  DefaultConfig());
+  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 50, 50, 0).data(),
+                                  CloudPacket(ts, total, 50, 50, 0).size(),
+                                  DefaultConfig());
+  ASSERT_TRUE(p0.ok) << p0.reason;
+  ASSERT_TRUE(p1.ok) << p1.reason;
+  EXPECT_FALSE(asm_.add_packet(p0).has_value());
+  auto frame = asm_.add_packet(p1);
+  ASSERT_TRUE(frame.has_value());
+  EXPECT_EQ(frame->total_points, 100ULL);
+  ASSERT_EQ(frame->points.size(), 100U);
+  EXPECT_FLOAT_EQ(frame->points[0].x, static_cast<float>(0 * 1e-3));
+  EXPECT_FLOAT_EQ(frame->points[50].x, static_cast<float>(5000 * 1e-3));
+  EXPECT_EQ(asm_.stats().frames_published, 1ULL);
+}
+
+TEST(LidarStreamReassembly, F4_PointOffsetPartialLastPacketPublishes) {
+  PointCloudFrameAssembler asm_(AssemblerConfig{});
+  const std::uint64_t ts = 1001;
+  const std::uint32_t total = 120;
+  auto p0 = ParsePointCloudPacket(CloudPacket(ts, total, 0, 50, 0).data(),
+                                  CloudPacket(ts, total, 0, 50, 0).size(),
+                                  DefaultConfig());
+  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 50, 50, 0).data(),
+                                  CloudPacket(ts, total, 50, 50, 0).size(),
+                                  DefaultConfig());
+  auto p2 = ParsePointCloudPacket(CloudPacket(ts, total, 100, 20, 0).data(),
+                                  CloudPacket(ts, total, 100, 20, 0).size(),
+                                  DefaultConfig());
+  EXPECT_FALSE(asm_.add_packet(p0).has_value());
+  EXPECT_FALSE(asm_.add_packet(p2).has_value());
+  auto frame = asm_.add_packet(p1);
+  ASSERT_TRUE(frame.has_value());
+  ASSERT_EQ(frame->points.size(), 120U);
+  EXPECT_EQ(frame->total_points, 120ULL);
+}
+
+TEST(LidarStreamReassembly, F4_PointOffsetGapDoesNotPublish) {
+  PointCloudFrameAssembler asm_(AssemblerConfig{});
+  const std::uint64_t ts = 1002;
+  const std::uint32_t total = 120;
+  auto p0 = ParsePointCloudPacket(CloudPacket(ts, total, 0, 30, 0).data(),
+                                  CloudPacket(ts, total, 0, 30, 0).size(),
+                                  DefaultConfig());
+  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 40, 30, 0).data(),
+                                  CloudPacket(ts, total, 40, 30, 0).size(),
+                                  DefaultConfig());
+  auto p2 = ParsePointCloudPacket(CloudPacket(ts, total, 80, 40, 0).data(),
+                                  CloudPacket(ts, total, 80, 40, 0).size(),
+                                  DefaultConfig());
+  EXPECT_FALSE(asm_.add_packet(p0).has_value());
+  EXPECT_FALSE(asm_.add_packet(p1).has_value());
+  // Sum is 30+30+40=100 < total and there are gaps at 30..39 and 70..79.
+  EXPECT_FALSE(asm_.add_packet(p2).has_value());
+  EXPECT_EQ(asm_.stats().frames_published, 0ULL);
+  EXPECT_EQ(asm_.in_flight_count(), 1U);
+}
+
+TEST(LidarStreamReassembly, F4_PointOffsetOverlapDropsFrame) {
+  PointCloudFrameAssembler asm_(AssemblerConfig{});
+  const std::uint64_t ts = 1003;
+  const std::uint32_t total = 100;
+  auto p0 = ParsePointCloudPacket(CloudPacket(ts, total, 0, 50, 0).data(),
+                                  CloudPacket(ts, total, 0, 50, 0).size(),
+                                  DefaultConfig());
+  auto p1 = ParsePointCloudPacket(CloudPacket(ts, total, 25, 50, 0).data(),
+                                  CloudPacket(ts, total, 25, 50, 0).size(),
+                                  DefaultConfig());
+  EXPECT_FALSE(asm_.add_packet(p0).has_value());
+  EXPECT_FALSE(asm_.add_packet(p1).has_value());
+  EXPECT_EQ(asm_.stats().frames_dropped_conflict, 1ULL);
+  EXPECT_EQ(asm_.in_flight_count(), 0U);
+}
+
+TEST(LidarStreamReassembly, F4_PointOffsetIndexBeyondTotalRejected) {
+  PointCloudFrameAssembler asm_(AssemblerConfig{});
+  const std::uint64_t ts = 1004;
+  const std::uint32_t total = 100;
+  auto pk = ParsePointCloudPacket(CloudPacket(ts, total, 100, 1, 0).data(),
+                                  CloudPacket(ts, total, 100, 1, 0).size(),
+                                  DefaultConfig());
+  ASSERT_TRUE(pk.ok) << pk.reason;
+  EXPECT_FALSE(asm_.add_packet(pk).has_value());
+  EXPECT_EQ(asm_.stats().packets_rejected, 1ULL);
 }
 
 // ---------------------------------------------------------------------------

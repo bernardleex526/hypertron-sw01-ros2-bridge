@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -155,18 +156,16 @@ struct AssemblerConfig {
   std::size_t max_packets_per_frame{40000};
 };
 
-// Reassembles a single point-cloud frame from its UDP packet sequence
-// (each frame is split across several indexed packets). Per the SW01 manual
-// `index` is the packet's sequence number within the current frame and
-// `total` is the frame's total point count. The index base (0-based or
-// 1-based) is deliberately not assumed: a frame publishes only when its
-// observed index set covers contiguously from the base (0 or 1) AND the
-// points across those packets sum to `total`, so the observed indices prove
-// their own base and the point count proves the frame is whole. Packets whose
-// declared total exceeds max_points_per_frame, whose index exceeds
-// max_packets_per_frame, or that would drive the slot's accumulated point
-// count past `total` or max_points_per_frame are rejected (the frame dropped
-// as a conflict in the last case).
+// Reassembles a single point-cloud frame from its UDP packets. On the real
+// SW01, `index` is the starting point offset of the packet within the current
+// frame (e.g. 0, 50, 100, ...), and `total` is the frame's total point count.
+// A frame publishes only when the packet ranges exactly cover [0, total)
+// (0-based) with no gaps and no overlaps, and the points across those packets
+// sum to `total`. Packets whose declared total exceeds max_points_per_frame,
+// whose offset is outside the frame, whose range would overlap an already
+// accepted packet, or that would drive the slot's accumulated point count
+// past `total` or max_points_per_frame are rejected (the frame is dropped as
+// a conflict in the overlap/overflow cases).
 //
 // Single-threaded use only. Thread coordination is the responsibility of the
 // upper layer (see LidarStreamReceiver). No method is internally locked.
@@ -213,14 +212,14 @@ class PointCloudFrameAssembler {
     bool active{false};
     std::uint64_t timestamp_ns{};
     std::uint64_t total{};  // declared total for the slot version
-    // storage keyed by raw packet index -> point data. An empty inner
-    // vector means that index is not (yet) observed. Slot 0 is unused for a
-    // 1-based frame.
-    std::vector<std::vector<LidarPoint>> packets;
+    // Storage keyed by the packet's starting point offset -> point data.
+    // Sorted by offset; a frame completes when the ranges exactly cover
+    // [0, total) with no gaps or overlaps.
+    std::map<std::uint32_t, std::vector<LidarPoint>> packets;
     std::size_t unique_indices{};
     // Sum of points across the uniquely observed packets for this slot. A
     // frame completes only when this equals the declared total (and the
-    // observed index set is contiguous from the base).
+    // ranges cover [0, total) exactly).
     std::size_t sum_points{};
     // When this slot was (re)activated; used for expire().
     std::chrono::steady_clock::time_point activated_at{};

@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <future>
 #include <limits>
@@ -62,45 +63,118 @@ namespace {
 using RobotStateMsg = hypertron_ros2_bridge::msg::RobotState;
 
 // Names accepted by /robot_mode, compared case-insensitively after trimming.
-const std::vector<std::string>& robot_mode_names() {
+const std::vector<std::string> &robot_mode_names() {
   static const std::vector<std::string> names = {
-      "damping",  "stand",       "down",         "move",
-      "auto_charge", "exit_charge", "recover",    "recovery",
+      "damping",     "stand",       "down",    "move",
+      "auto_charge", "exit_charge", "recover", "recovery",
   };
   return names;
 }
 
-std::string trimmed_lower(const std::string& in) {
+std::string trimmed_lower(const std::string &in) {
   const auto first = in.find_first_not_of(" \t\r\n");
   if (first == std::string::npos) {
     return std::string{};
   }
   const auto last = in.find_last_not_of(" \t\r\n");
   std::string out = in.substr(first, last - first + 1);
-  std::transform(out.begin(), out.end(), out.begin(),
-                 [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  std::transform(out.begin(), out.end(), out.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
   return out;
 }
 
 bool finite_float(float v) { return std::isfinite(v); }
 
-bool valid_ipv4(const std::string& value) {
+bool valid_ipv4(const std::string &value) {
   in_addr addr{};
   return inet_pton(AF_INET, value.c_str(), &addr) == 1;
 }
 
-}  // namespace
+// Odin1's UDP 6100/6101 timestamps are nanoseconds on a common device
+// monotonic clock, not Unix time. Convert that clock into the ROS clock using
+// UDP 6101 odometry arrivals as low-latency anchors. Point-cloud frames are
+// only emitted after hundreds of packets have been assembled, so using their
+// completion time as an anchor would make each scan artificially late.
+class LidarDeviceClockMapper {
+public:
+  rclcpp::Time observe_odometry(std::uint64_t device_ns,
+                                const rclcpp::Time &receive_time) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const std::int64_t receive_ns = receive_time.nanoseconds();
+    if (device_ns >
+        static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+      return receive_time;
+    }
+    const std::int64_t device = static_cast<std::int64_t>(device_ns);
+    const std::int64_t observed_offset = receive_ns - device;
+
+    // A device restart or a multi-second discontinuity invalidates the old
+    // offset. Otherwise follow lower-latency observations immediately and
+    // track increasing clock drift slowly so network jitter cannot move
+    // timestamps into the future.
+    constexpr std::int64_t kRestartToleranceNs = 1000000000LL;
+    constexpr std::int64_t kOffsetJumpNs = 2000000000LL;
+    const bool device_restarted =
+        initialized_ && device + kRestartToleranceNs < last_device_ns_;
+    const bool offset_jumped =
+        initialized_ &&
+        std::llabs(observed_offset - offset_ns_) > kOffsetJumpNs;
+    if (!initialized_ || device_restarted || offset_jumped) {
+      offset_ns_ = observed_offset;
+      initialized_ = true;
+    } else if (observed_offset < offset_ns_) {
+      offset_ns_ = observed_offset;
+    } else {
+      // 1/64 IIR step: enough to follow oscillator drift while rejecting the
+      // tens-of-milliseconds receive jitter seen in the real pcap captures.
+      offset_ns_ += (observed_offset - offset_ns_) / 64;
+    }
+    last_device_ns_ = device;
+    return mapped_time(device, receive_time);
+  }
+
+  rclcpp::Time map_cloud(std::uint64_t device_ns,
+                         const rclcpp::Time &receive_time) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!initialized_ ||
+        device_ns > static_cast<std::uint64_t>(
+                        std::numeric_limits<std::int64_t>::max())) {
+      return receive_time;
+    }
+    return mapped_time(static_cast<std::int64_t>(device_ns), receive_time);
+  }
+
+private:
+  rclcpp::Time mapped_time(std::int64_t device_ns,
+                           const rclcpp::Time &receive_time) const {
+    const std::int64_t mapped_ns = device_ns + offset_ns_;
+    // A sensor sample cannot legitimately be newer than the callback that
+    // received it. Clamp defensively if clock drift estimation overshoots.
+    return rclcpp::Time(std::min(mapped_ns, receive_time.nanoseconds()),
+                        receive_time.get_clock_type());
+  }
+
+  std::mutex mutex_;
+  bool initialized_{false};
+  std::int64_t offset_ns_{0};
+  std::int64_t last_device_ns_{0};
+};
+
+} // namespace
 
 struct HypertronDriverNode::Impl {
   // Concrete RuntimeObserver that forwards to Impl's private handlers. Held
   // by value and declared before runtime_ so it outlives the runtime (the
   // runtime holds a raw pointer to it).
   struct NodeObserver : public RuntimeObserver {
-    Impl& impl;
-    explicit NodeObserver(Impl& owner) : impl(owner) {}
-    void on_state(const SdkSnapshot& snapshot) override { impl.on_state(snapshot); }
-    void on_imu(const ImuSample& sample) override { impl.on_imu(sample); }
-    void on_sport(const SportSample& sample) override { impl.on_sport(sample); }
+    Impl &impl;
+    explicit NodeObserver(Impl &owner) : impl(owner) {}
+    void on_state(const SdkSnapshot &snapshot) override {
+      impl.on_state(snapshot);
+    }
+    void on_imu(const ImuSample &sample) override { impl.on_imu(sample); }
+    void on_sport(const SportSample &sample) override { impl.on_sport(sample); }
     void on_status(bool linked, bool control_authority) override {
       impl.on_status(linked, control_authority);
     }
@@ -109,7 +183,7 @@ struct HypertronDriverNode::Impl {
     }
   };
 
-  explicit Impl(HypertronDriverNode& node, std::unique_ptr<IAstrallSdk> sdk,
+  explicit Impl(HypertronDriverNode &node, std::unique_ptr<IAstrallSdk> sdk,
                 std::unique_ptr<INetworkPreflight> preflight,
                 std::unique_ptr<ILidarDatagramSource> point_cloud_source,
                 std::unique_ptr<ILidarDatagramSource> odometry_source)
@@ -150,7 +224,7 @@ struct HypertronDriverNode::Impl {
   // RuntimeObserver handlers (may arrive on the runtime worker or a vendor
   // SDK thread). Never block; never call back into runtime_.
   // ------------------------------------------------------------------
-  void on_state(const SdkSnapshot& snapshot) {
+  void on_state(const SdkSnapshot &snapshot) {
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       snapshot_ = snapshot;
@@ -165,7 +239,7 @@ struct HypertronDriverNode::Impl {
     }
   }
 
-  void on_imu(const ImuSample& sample) {
+  void on_imu(const ImuSample &sample) {
     if (!imu_sample_finite(sample)) {
       update_last_error(
           "dropped sample: IMU telemetry contained a non-finite value");
@@ -222,7 +296,7 @@ struct HypertronDriverNode::Impl {
     }
   }
 
-  void on_sport(const SportSample& sample) {
+  void on_sport(const SportSample &sample) {
     for (float value : sample.wheel_speed) {
       if (!finite_float(value)) {
         update_last_error(
@@ -266,19 +340,19 @@ struct HypertronDriverNode::Impl {
       publish_robot_state();
     }
     switch (severity) {
-      case kRuntimeEventError:
-        RCLCPP_ERROR_THROTTLE(node.get_logger(), *node.get_clock(), 1000,
-                              "runtime error: %s", message.c_str());
-        break;
-      case kRuntimeEventWarning:
-        RCLCPP_WARN_THROTTLE(node.get_logger(), *node.get_clock(), 1000,
-                             "runtime warning: %s", message.c_str());
-        break;
-      default:
-      case kRuntimeEventInfo:
-        RCLCPP_DEBUG_THROTTLE(node.get_logger(), *node.get_clock(), 1000,
-                              "runtime: %s", message.c_str());
-        break;
+    case kRuntimeEventError:
+      RCLCPP_ERROR_THROTTLE(node.get_logger(), *node.get_clock(), 1000,
+                            "runtime error: %s", message.c_str());
+      break;
+    case kRuntimeEventWarning:
+      RCLCPP_WARN_THROTTLE(node.get_logger(), *node.get_clock(), 1000,
+                           "runtime warning: %s", message.c_str());
+      break;
+    default:
+    case kRuntimeEventInfo:
+      RCLCPP_DEBUG_THROTTLE(node.get_logger(), *node.get_clock(), 1000,
+                            "runtime: %s", message.c_str());
+      break;
     }
   }
 
@@ -315,7 +389,7 @@ struct HypertronDriverNode::Impl {
       return;
     }
     const std::string name = trimmed_lower(msg->data);
-    const auto& names = robot_mode_names();
+    const auto &names = robot_mode_names();
     if (std::find(names.begin(), names.end(), name) == names.end()) {
       RCLCPP_WARN_THROTTLE(
           node.get_logger(), *node.get_clock(), 1000,
@@ -328,20 +402,22 @@ struct HypertronDriverNode::Impl {
         std::future_status::ready) {
       const Result result = future.get();
       if (result.success()) {
-        RCLCPP_INFO(node.get_logger(), "Robot mode '%s' confirmed", name.c_str());
+        RCLCPP_INFO(node.get_logger(), "Robot mode '%s' confirmed",
+                    name.c_str());
       } else {
         RCLCPP_WARN(node.get_logger(), "Robot mode '%s' failed: %s",
                     name.c_str(), result.message.c_str());
       }
     } else {
-      RCLCPP_DEBUG(node.get_logger(), "Robot mode '%s' in progress", name.c_str());
+      RCLCPP_DEBUG(node.get_logger(), "Robot mode '%s' in progress",
+                   name.c_str());
     }
   }
 
   // Token-bearing rejection path for joint commands (ASTRALL exposes no joint
   // API). Counts rejections, records the reason, re-publishes state, throttled
   // warning.
-  void reject_joint_command(const std::string& reason) {
+  void reject_joint_command(const std::string &reason) {
     rejected_joint_commands_.fetch_add(1, std::memory_order_relaxed);
     update_last_error(reason);
     publish_robot_state();
@@ -349,7 +425,8 @@ struct HypertronDriverNode::Impl {
                          reason.c_str());
   }
 
-  void on_joint_commands(const sensor_msgs::msg::JointState::SharedPtr /*msg*/) {
+  void
+  on_joint_commands(const sensor_msgs::msg::JointState::SharedPtr /*msg*/) {
     reject_joint_command(
         "joint command rejected: ASTRALL 1.0.7 exposes no joint API");
   }
@@ -381,8 +458,9 @@ struct HypertronDriverNode::Impl {
     publish_robot_state();
   }
 
-  void on_control_authority(const std_srvs::srv::SetBool::Request::SharedPtr req,
-                            std_srvs::srv::SetBool::Response::SharedPtr resp) {
+  void
+  on_control_authority(const std_srvs::srv::SetBool::Request::SharedPtr req,
+                       std_srvs::srv::SetBool::Response::SharedPtr resp) {
     if (!runtime_) {
       resp->success = false;
       resp->message = "runtime not available";
@@ -403,7 +481,7 @@ struct HypertronDriverNode::Impl {
     publish_robot_state();
   }
 
- private:
+private:
   // ------------------------------------------------------------------
   // Parameter handling.
   // ------------------------------------------------------------------
@@ -454,7 +532,10 @@ struct HypertronDriverNode::Impl {
     node.declare_parameter("lidar.odom_position_scale", 1.0e-6);
     node.declare_parameter("lidar.odom_quaternion_scale", 1.0);
     node.declare_parameter("lidar.odom_quaternion_order", "xyzw");
-    node.declare_parameter("lidar.frame_id", "lidar");
+    // UDP 6100 points use a raw sensor axis convention that is rotated from
+    // the body-aligned frame reported by UDP 6101 odometry. Keep the frames
+    // distinct so mapping.launch.py can publish the calibrated transform.
+    node.declare_parameter("lidar.frame_id", "lidar_points");
     node.declare_parameter("lidar.frame_timeout_ms", 300);
     node.declare_parameter("lidar.max_parallel_frames", 4);
     node.declare_parameter("lidar.max_points_per_frame", 2000000);
@@ -463,8 +544,9 @@ struct HypertronDriverNode::Impl {
     node.declare_parameter("odom_lidar.parent_frame", "odom");
     node.declare_parameter("odom_lidar.child_frame", "lidar");
     node.declare_parameter("odom_lidar.publish_tf", false);
-    node.declare_parameter("odom_lidar.pose_covariance_diagonal",
-                           std::vector<double>{0.05, 0.05, 0.05, 0.01, 0.01, 0.01});
+    node.declare_parameter(
+        "odom_lidar.pose_covariance_diagonal",
+        std::vector<double>{0.05, 0.05, 0.05, 0.01, 0.01, 0.01});
 
     node.declare_parameter("imu.quaternion_order", "xyzw");
     node.declare_parameter("imu.orientation_covariance_diagonal",
@@ -483,7 +565,7 @@ struct HypertronDriverNode::Impl {
     // error, so the whole node construction fails (main exits non-zero) rather
     // than silently clamping, wrapping to a negative value, or allocating an
     // unbounded buffer. This runs before any receiver or runtime is built.
-    auto fail = [this](const std::string& message) {
+    auto fail = [this](const std::string &message) {
       throw rclcpp::exceptions::InvalidParametersException(message);
     };
 
@@ -507,8 +589,7 @@ struct HypertronDriverNode::Impl {
 
     // Bind/source addresses are validated here instead of degrading to a
     // permanently disabled stream or an all-dropped filter at runtime.
-    const std::string bind_ip =
-        node.get_parameter("lidar.bind_ip").as_string();
+    const std::string bind_ip = node.get_parameter("lidar.bind_ip").as_string();
     if (!valid_ipv4(bind_ip)) {
       fail("lidar.bind_ip='" + bind_ip + "' is not a valid IPv4 address");
     }
@@ -519,11 +600,11 @@ struct HypertronDriverNode::Impl {
     }
 
     // Every *_ms timing / timeout must be strictly positive.
-    for (const char* p :
-         {"sdk.init_timeout_ms",       "sdk.call_timeout_ms",
+    for (const char *p :
+         {"sdk.init_timeout_ms", "sdk.call_timeout_ms",
           "sdk.heartbeat_call_timeout_ms", "timing.heartbeat_period_ms",
           "timing.motion_refresh_period_ms", "timing.state_poll_period_ms",
-          "timing.mode_timeout_ms",    "timing.reconnect_initial_delay_ms",
+          "timing.mode_timeout_ms", "timing.reconnect_initial_delay_ms",
           "timing.reconnect_max_delay_ms", "safety.command_deadman_ms",
           "lidar.frame_timeout_ms"}) {
       const int ms = node.get_parameter(p).as_int();
@@ -579,7 +660,7 @@ struct HypertronDriverNode::Impl {
     }
 
     // Scale coefficients: finite and within (0, 1e9].
-    for (const char* p :
+    for (const char *p :
          {"lidar.point_position_scale", "lidar.odom_position_scale",
           "lidar.odom_quaternion_scale"}) {
       const double scale = node.get_parameter(p).as_double();
@@ -601,8 +682,7 @@ struct HypertronDriverNode::Impl {
         node.get_parameter("sdk.heartbeat_max_failures").as_int();
     if (heartbeat_max_failures < 1) {
       fail("sdk.heartbeat_max_failures=" +
-           std::to_string(heartbeat_max_failures) +
-           " must be >= 1");
+           std::to_string(heartbeat_max_failures) + " must be >= 1");
     }
     const int reconnect_initial =
         node.get_parameter("timing.reconnect_initial_delay_ms").as_int();
@@ -611,8 +691,8 @@ struct HypertronDriverNode::Impl {
     if (reconnect_initial > reconnect_max) {
       fail("timing.reconnect_initial_delay_ms (" +
            std::to_string(reconnect_initial) + ") exceeds " +
-           "timing.reconnect_max_delay_ms (" +
-           std::to_string(reconnect_max) + ")");
+           "timing.reconnect_max_delay_ms (" + std::to_string(reconnect_max) +
+           ")");
     }
 
     const int motion_refresh_ms =
@@ -664,8 +744,7 @@ struct HypertronDriverNode::Impl {
       quaternion_order_wxyz_ = false;
     } else {
       throw rclcpp::exceptions::InvalidParametersException(
-          "imu.quaternion_order='" + order +
-          "' is not 'xyzw' or 'wxyz'");
+          "imu.quaternion_order='" + order + "' is not 'xyzw' or 'wxyz'");
     }
 
     // The frame-name parameters were previously declared but never read;
@@ -677,9 +756,9 @@ struct HypertronDriverNode::Impl {
       fail("frame names must not be empty");
     }
 
-    orientation_covariance_ =
-        diagonal_covariance(node.get_parameter("imu.orientation_covariance_diagonal")
-                                .as_double_array());
+    orientation_covariance_ = diagonal_covariance(
+        node.get_parameter("imu.orientation_covariance_diagonal")
+            .as_double_array());
     angular_velocity_covariance_ = diagonal_covariance(
         node.get_parameter("imu.angular_velocity_covariance_diagonal")
             .as_double_array());
@@ -700,7 +779,8 @@ struct HypertronDriverNode::Impl {
             .as_double_array());
 
     // LiDAR stream configuration resolved at construction.
-    lidar_enabled_ = node.get_parameter("subscriptions.lidar_enabled").as_bool();
+    lidar_enabled_ =
+        node.get_parameter("subscriptions.lidar_enabled").as_bool();
     points_topic_ = node.get_parameter("topics.points").as_string();
     odom_lidar_topic_ = node.get_parameter("topics.odom_lidar").as_string();
     lidar_.point_cloud_port = static_cast<std::uint16_t>(
@@ -710,8 +790,8 @@ struct HypertronDriverNode::Impl {
     lidar_.bind_ip = node.get_parameter("lidar.bind_ip").as_string();
     lidar_.source_ip = node.get_parameter("lidar.source_ip").as_string();
     lidar_.frame_id = node.get_parameter("lidar.frame_id").as_string();
-    lidar_.frame_timeout_ms = static_cast<int>(
-        node.get_parameter("lidar.frame_timeout_ms").as_int());
+    lidar_.frame_timeout_ms =
+        static_cast<int>(node.get_parameter("lidar.frame_timeout_ms").as_int());
     lidar_.max_parallel_frames = static_cast<std::size_t>(
         node.get_parameter("lidar.max_parallel_frames").as_int());
     lidar_.max_points_per_frame = static_cast<std::size_t>(
@@ -735,34 +815,33 @@ struct HypertronDriverNode::Impl {
     odom_lidar_.pose_covariance_diagonal =
         node.get_parameter("odom_lidar.pose_covariance_diagonal")
             .as_double_array();
-    validate_covariance_diagonal(
-        "odom_lidar.pose_covariance_diagonal",
-        odom_lidar_.pose_covariance_diagonal);
+    validate_covariance_diagonal("odom_lidar.pose_covariance_diagonal",
+                                 odom_lidar_.pose_covariance_diagonal);
   }
 
   SubscriptionFrequency frequency_from_hz(int hz) {
     switch (hz) {
-      case 0:
-        return SubscriptionFrequency::Disabled;
-      case 1:
-        return SubscriptionFrequency::Hz1;
-      case 25:
-        return SubscriptionFrequency::Hz25;
-      case 50:
-        return SubscriptionFrequency::Hz50;
-      case 125:
-        return SubscriptionFrequency::Hz125;
-      case 250:
-        return SubscriptionFrequency::Hz250;
-      default:
-        throw rclcpp::exceptions::InvalidParametersException(
-            "subscription frequency " + std::to_string(hz) +
-            " Hz is not valid (must be one of 0/1/25/50/125/250)");
+    case 0:
+      return SubscriptionFrequency::Disabled;
+    case 1:
+      return SubscriptionFrequency::Hz1;
+    case 25:
+      return SubscriptionFrequency::Hz25;
+    case 50:
+      return SubscriptionFrequency::Hz50;
+    case 125:
+      return SubscriptionFrequency::Hz125;
+    case 250:
+      return SubscriptionFrequency::Hz250;
+    default:
+      throw rclcpp::exceptions::InvalidParametersException(
+          "subscription frequency " + std::to_string(hz) +
+          " Hz is not valid (must be one of 0/1/25/50/125/250)");
     }
   }
 
-  static std::array<double, 9> diagonal_covariance(
-      const std::vector<double>& diag) {
+  static std::array<double, 9>
+  diagonal_covariance(const std::vector<double> &diag) {
     std::array<double, 9> cov{};
     for (std::size_t i = 0; i < 3; ++i) {
       double value =
@@ -774,8 +853,8 @@ struct HypertronDriverNode::Impl {
 
   // Every diagonal covariance coefficient must be finite and >= 0; an
   // invalid coefficient is a configuration error that fails construction.
-  void validate_covariance_diagonal(const std::string& name,
-                                    const std::vector<double>& diag) {
+  void validate_covariance_diagonal(const std::string &name,
+                                    const std::vector<double> &diag) {
     for (std::size_t i = 0; i < diag.size(); ++i) {
       if (!std::isfinite(diag[i]) || diag[i] < 0.0) {
         throw rclcpp::exceptions::InvalidParametersException(
@@ -796,7 +875,8 @@ struct HypertronDriverNode::Impl {
     const std::string joint_topic =
         node.get_parameter("topics.joint_commands").as_string();
     const std::string imu_topic = node.get_parameter("topics.imu").as_string();
-    const std::string odom_topic = node.get_parameter("topics.odom").as_string();
+    const std::string odom_topic =
+        node.get_parameter("topics.odom").as_string();
     const std::string state_topic =
         node.get_parameter("topics.robot_state").as_string();
 
@@ -824,7 +904,9 @@ struct HypertronDriverNode::Impl {
         });
     mode_sub_ = node.create_subscription<std_msgs::msg::String>(
         mode_topic, rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
-        [this](const std_msgs::msg::String::SharedPtr msg) { on_robot_mode(msg); });
+        [this](const std_msgs::msg::String::SharedPtr msg) {
+          on_robot_mode(msg);
+        });
     joint_sub_ = node.create_subscription<sensor_msgs::msg::JointState>(
         joint_topic, rclcpp::QoS(rclcpp::KeepLast(1)).reliable(),
         [this](const sensor_msgs::msg::JointState::SharedPtr msg) {
@@ -881,10 +963,12 @@ struct HypertronDriverNode::Impl {
   // a null source defaults to binding the configured port. A bind failure
   // (port in use) logs an error and skips that stream without taking the node
   // down: the SDK, motion, and /odom diagnostics stay fully functional.
-  void create_receivers(std::unique_ptr<ILidarDatagramSource> point_cloud_source,
-                        std::unique_ptr<ILidarDatagramSource> odometry_source) {
+  void
+  create_receivers(std::unique_ptr<ILidarDatagramSource> point_cloud_source,
+                   std::unique_ptr<ILidarDatagramSource> odometry_source) {
     if (!lidar_enabled_) {
-      RCLCPP_DEBUG(node.get_logger(), "LiDAR stream disabled; no UDP receivers");
+      RCLCPP_DEBUG(node.get_logger(),
+                   "LiDAR stream disabled; no UDP receivers");
       return;
     }
     LidarParseConfig parse_cfg;
@@ -894,15 +978,20 @@ struct HypertronDriverNode::Impl {
     parse_cfg.odom_quaternion_order = lidar_.odom_quaternion_order;
 
     AssemblerConfig assembler_cfg;
-    assembler_cfg.frame_timeout = std::chrono::milliseconds(lidar_.frame_timeout_ms);
+    assembler_cfg.frame_timeout =
+        std::chrono::milliseconds(lidar_.frame_timeout_ms);
     assembler_cfg.max_parallel_frames = lidar_.max_parallel_frames;
     assembler_cfg.max_points_per_frame = lidar_.max_points_per_frame;
     assembler_cfg.max_packets_per_frame = lidar_.max_packets_per_frame;
 
     LidarSink sink;
-    sink.on_frame = [this](const PointCloudFrame& frame) { on_lidar_frame(frame); };
-    sink.on_odometry = [this](const LidarOdometry& odom) { on_lidar_odometry(odom); };
-    const auto parse_warning = [this](const std::string& reason) {
+    sink.on_frame = [this](const PointCloudFrame &frame) {
+      on_lidar_frame(frame);
+    };
+    sink.on_odometry = [this](const LidarOdometry &odom) {
+      on_lidar_odometry(odom);
+    };
+    const auto parse_warning = [this](const std::string &reason) {
       // The receiver already throttles to ~1 Hz; record directly.
       RCLCPP_WARN_THROTTLE(node.get_logger(), *node.get_clock(), 1000,
                            "LiDAR parse warning: %s", reason.c_str());
@@ -966,12 +1055,14 @@ struct HypertronDriverNode::Impl {
   // Receiver thread -> publisher (thread-safe, never blocks, never calls
   // runtime). Converts one complete frame to a sensor_msgs/PointCloud2 with
   // the standard PointXYZRGBA layout.
-  void on_lidar_frame(const PointCloudFrame& frame) {
+  void on_lidar_frame(const PointCloudFrame &frame) {
     if (!points_pub_) {
       return;
     }
+    const auto receive_time = node.get_clock()->now();
     sensor_msgs::msg::PointCloud2 msg;
-    msg.header.stamp = node.get_clock()->now();
+    msg.header.stamp =
+        lidar_device_clock_.map_cloud(frame.timestamp_ns, receive_time);
     msg.header.frame_id = lidar_.frame_id;
     msg.height = 1U;
     msg.width = static_cast<std::uint32_t>(frame.points.size());
@@ -981,19 +1072,31 @@ struct HypertronDriverNode::Impl {
     msg.row_step = msg.point_step * msg.width;
 
     sensor_msgs::msg::PointField x;
-    x.name = "x"; x.offset = 0U; x.datatype = sensor_msgs::msg::PointField::FLOAT32; x.count = 1U;
+    x.name = "x";
+    x.offset = 0U;
+    x.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    x.count = 1U;
     sensor_msgs::msg::PointField y;
-    y.name = "y"; y.offset = 4U; y.datatype = sensor_msgs::msg::PointField::FLOAT32; y.count = 1U;
+    y.name = "y";
+    y.offset = 4U;
+    y.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    y.count = 1U;
     sensor_msgs::msg::PointField z;
-    z.name = "z"; z.offset = 8U; z.datatype = sensor_msgs::msg::PointField::FLOAT32; z.count = 1U;
+    z.name = "z";
+    z.offset = 8U;
+    z.datatype = sensor_msgs::msg::PointField::FLOAT32;
+    z.count = 1U;
     sensor_msgs::msg::PointField rgba;
-    rgba.name = "rgba"; rgba.offset = 12U; rgba.datatype = sensor_msgs::msg::PointField::UINT32; rgba.count = 1U;
+    rgba.name = "rgba";
+    rgba.offset = 12U;
+    rgba.datatype = sensor_msgs::msg::PointField::UINT32;
+    rgba.count = 1U;
     msg.fields = {x, y, z, rgba};
 
     msg.data.resize(msg.point_step * frame.points.size());
     for (std::size_t i = 0; i < frame.points.size(); ++i) {
-      const LidarPoint& p = frame.points[i];
-      std::uint8_t* dst = msg.data.data() + i * msg.point_step;
+      const LidarPoint &p = frame.points[i];
+      std::uint8_t *dst = msg.data.data() + i * msg.point_step;
       float f;
       f = p.x;
       std::memcpy(dst + 0, &f, sizeof(float));
@@ -1009,7 +1112,7 @@ struct HypertronDriverNode::Impl {
   // Receiver thread -> publisher (thread-safe, never blocks, never calls
   // runtime). Normalizes the quaternion defensively; a ~zero norm is dropped
   // with a throttled warning (a point cloud can still flow).
-  void on_lidar_odometry(const LidarOdometry& odom) {
+  void on_lidar_odometry(const LidarOdometry &odom) {
     if (!odom_lidar_pub_) {
       return;
     }
@@ -1022,8 +1125,11 @@ struct HypertronDriverNode::Impl {
       return;
     }
 
+    const auto receive_time = node.get_clock()->now();
+    const auto sensor_time =
+        lidar_device_clock_.observe_odometry(odom.timestamp_ns, receive_time);
     nav_msgs::msg::Odometry msg;
-    msg.header.stamp = node.get_clock()->now();
+    msg.header.stamp = sensor_time;
     msg.header.frame_id = odom_lidar_.parent_frame;
     msg.child_frame_id = odom_lidar_.child_frame;
     msg.pose.pose.position.x = odom.x;
@@ -1034,25 +1140,30 @@ struct HypertronDriverNode::Impl {
     msg.pose.pose.orientation.z = odom.qz / norm;
     msg.pose.pose.orientation.w = odom.qw / norm;
     // Pose covariance: package the configured diagonal into the 6x6 matrix.
-    const auto& diag = odom_lidar_.pose_covariance_diagonal;
+    const auto &diag = odom_lidar_.pose_covariance_diagonal;
     for (std::size_t i = 0; i < 6; ++i) {
-      const double value = (i < diag.size() && std::isfinite(diag[i])) ? diag[i] : 0.0;
+      const double value =
+          (i < diag.size() && std::isfinite(diag[i])) ? diag[i] : 0.0;
       msg.pose.covariance[i * 7] = value;
     }
     // No twist is reported by the lidar stream; leave the 6x6 twist
     // covariance and the twist at their all-zero defaults.
     odom_lidar_pub_->publish(msg);
     if (lidar_tf_broadcaster_) {
-      publish_lidar_tf(odom, norm);
+      publish_lidar_tf(odom, norm, sensor_time);
     }
   }
 
   // Publishes the LiDAR odometry as odom->child_frame TF when explicitly
   // enabled and odometry.scale_verified=true. With a static lidar->base_link
   // transform this completes the odom->base_link chain for SLAM/Nav2.
-  void publish_lidar_tf(const LidarOdometry& odom, double norm) {
+  void publish_lidar_tf(const LidarOdometry &odom, double norm,
+                        const rclcpp::Time &sensor_time) {
     geometry_msgs::msg::TransformStamped t;
-    t.header.stamp = node.get_clock()->now();
+    // The odometry message and odom->lidar TF must have exactly the same
+    // timestamp. Separate now() calls can place the TF just after the scan
+    // and make tf2 wait until its small message-filter queue overflows.
+    t.header.stamp = sensor_time;
     t.header.frame_id = odom_lidar_.parent_frame;
     t.child_frame_id = odom_lidar_.child_frame;
     t.transform.translation.x = odom.x;
@@ -1121,8 +1232,8 @@ struct HypertronDriverNode::Impl {
 
     cfg.deadman_ms = std::chrono::milliseconds(
         node.get_parameter("safety.command_deadman_ms").as_int());
-    cfg.queue_capacity =
-        static_cast<std::size_t>(node.get_parameter("safety.queue_capacity").as_int());
+    cfg.queue_capacity = static_cast<std::size_t>(
+        node.get_parameter("safety.queue_capacity").as_int());
 
     cfg.imu_freq = imu_freq_;
     cfg.sport_freq = sport_freq_;
@@ -1177,20 +1288,21 @@ struct HypertronDriverNode::Impl {
     msg.error_code = snapshot.error_code;
     msg.warning_code = snapshot.warning_code;
     msg.sport_status = snapshot.sport_status;
-    msg.battery_percentage =
-        finite_float(snapshot.battery_percentage) ? snapshot.battery_percentage
-                                                  : 0.0F;
-    msg.battery_temperature =
-        finite_float(snapshot.battery_temperature) ? snapshot.battery_temperature
-                                                   : 0.0F;
-    msg.battery_voltage =
-        finite_float(snapshot.battery_voltage) ? snapshot.battery_voltage
-                                               : 0.0F;
+    msg.battery_percentage = finite_float(snapshot.battery_percentage)
+                                 ? snapshot.battery_percentage
+                                 : 0.0F;
+    msg.battery_temperature = finite_float(snapshot.battery_temperature)
+                                  ? snapshot.battery_temperature
+                                  : 0.0F;
+    msg.battery_voltage = finite_float(snapshot.battery_voltage)
+                              ? snapshot.battery_voltage
+                              : 0.0F;
     msg.battery_cycle_count = snapshot.battery_cycle_count;
     msg.charge_status = snapshot.charge_status;
     for (std::size_t i = 0; i < msg.wheel_speed.size(); ++i) {
-      msg.wheel_speed[i] =
-          finite_float(snapshot.wheel_speed[i]) ? snapshot.wheel_speed[i] : 0.0F;
+      msg.wheel_speed[i] = finite_float(snapshot.wheel_speed[i])
+                               ? snapshot.wheel_speed[i]
+                               : 0.0F;
     }
     msg.protocol_rx_drops = 0;
     msg.rejected_joint_commands =
@@ -1222,7 +1334,7 @@ struct HypertronDriverNode::Impl {
   // ------------------------------------------------------------------
   // IMU helpers.
   // ------------------------------------------------------------------
-  bool imu_sample_finite(const ImuSample& sample) const {
+  bool imu_sample_finite(const ImuSample &sample) const {
     for (std::size_t i = 0; i < 3; ++i) {
       if (!finite_float(sample.accelerometer[i]) ||
           !finite_float(sample.gyroscope[i])) {
@@ -1241,8 +1353,8 @@ struct HypertronDriverNode::Impl {
 
   // Fills target (xyzw) from the configured source order; normalizes unless
   // the input norm is ~0. Returns false on a zero norm.
-  bool orientation_quaternion(const ImuSample& sample,
-                              geometry_msgs::msg::Quaternion& target) {
+  bool orientation_quaternion(const ImuSample &sample,
+                              geometry_msgs::msg::Quaternion &target) {
     float x, y, z, w;
     if (quaternion_order_wxyz_) {
       x = sample.quaternion[1];
@@ -1267,7 +1379,7 @@ struct HypertronDriverNode::Impl {
     return true;
   }
 
-  void update_last_error(const std::string& message) {
+  void update_last_error(const std::string &message) {
     std::lock_guard<std::mutex> lock(state_mutex_);
     last_error_ = message;
   }
@@ -1290,7 +1402,7 @@ struct HypertronDriverNode::Impl {
   // Members. Declaration order matters: clock, observer and node must outlive
   // runtime_; runtime_ is declared last and emplaced in the ctor body.
   // ------------------------------------------------------------------
-  HypertronDriverNode& node;
+  HypertronDriverNode &node;
   SteadyMonotonicClock clock;
   NodeObserver observer;
 
@@ -1318,7 +1430,7 @@ struct HypertronDriverNode::Impl {
     std::uint16_t odometry_port{6101};
     std::string bind_ip{"0.0.0.0"};
     std::string source_ip;
-    std::string frame_id{"lidar"};
+    std::string frame_id{"lidar_points"};
     int frame_timeout_ms{300};
     std::size_t max_parallel_frames{4};
     std::size_t max_points_per_frame{2000000};
@@ -1332,7 +1444,8 @@ struct HypertronDriverNode::Impl {
     std::string parent_frame{"odom"};
     std::string child_frame{"lidar"};
     bool publish_tf{false};
-    std::vector<double> pose_covariance_diagonal{0.05, 0.05, 0.05, 0.01, 0.01, 0.01};
+    std::vector<double> pose_covariance_diagonal{0.05, 0.05, 0.05,
+                                                 0.01, 0.01, 0.01};
   } odom_lidar_;
 
   // Publishers / subscribers / services.
@@ -1364,6 +1477,10 @@ struct HypertronDriverNode::Impl {
   std::mutex pose_mutex_;
   std::optional<geometry_msgs::msg::Pose> last_pose_;
 
+  // Shared UDP 6100/6101 device-clock mapping. The mapper is internally
+  // locked because the two receivers invoke it from separate threads.
+  LidarDeviceClockMapper lidar_device_clock_;
+
   // LiDAR bypass stream receivers. Declared before runtime_ and explicitly
   // stopped before runtime_->stop() in the destructor, so no receiver thread
   // can publish after the runtime (or their publishers) is torn down. Each
@@ -1388,4 +1505,4 @@ HypertronDriverNode::HypertronDriverNode(
 
 HypertronDriverNode::~HypertronDriverNode() = default;
 
-}  // namespace hypertron_ros2_bridge
+} // namespace hypertron_ros2_bridge

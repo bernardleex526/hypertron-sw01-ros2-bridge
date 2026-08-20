@@ -35,12 +35,15 @@ hypertron_driver:
       bind_ip: "0.0.0.0"
       # 期望的 UDP 源地址（点云/里程计包来自机器人）；换网段须同步修改。
       source_ip: "10.18.0.100"
-      point_position_scale: 0.001
-      odom_position_scale: 0.000001
+      point_position_scale: 0.0000191
+      odom_position_scale: 0.0000009474
       odom_quaternion_scale: 1.0
       # 6101 四元数分量顺序：xyzw（默认）或 wxyz（实机抓包后回填）。
       odom_quaternion_order: "xyzw"
-      frame_id: "lidar"
+      # UDP 6100 raw point axes are not the body-aligned axes used by the
+      # UDP 6101 odometry frame. mapping.launch.py publishes the calibrated
+      # lidar -> lidar_points rotation.
+      frame_id: "lidar_points"
       frame_timeout_ms: 300
       max_parallel_frames: 4
       max_points_per_frame: 2000000
@@ -52,7 +55,8 @@ hypertron_driver:
       parent_frame: "odom"
       child_frame: "lidar"
       # 将 /odom_lidar 作为 odom->lidar TF 发布；需 odometry.scale_verified=true
-      # 且 mapping.launch 提供 lidar->base_link 静态 TF 后才可进入 SLAM/Nav2。
+      # 且 mapping.launch 提供 lidar->base_link 与 lidar->lidar_points 静态 TF
+      # 后才可进入 SLAM/Nav2。
       publish_tf: false
       pose_covariance_diagonal: [0.05, 0.05, 0.05, 0.01, 0.01, 0.01]
 
@@ -84,4 +88,4 @@ hypertron_driver:
       publish_tf: false
 
     odometry:
-      scale_verified: false
+      scale_verified: true

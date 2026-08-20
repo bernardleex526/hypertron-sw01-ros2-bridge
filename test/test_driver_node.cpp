@@ -35,39 +35,39 @@
 
 #include <gtest/gtest.h>
 
+#include "fake_astrall_sdk.hpp"
+#include "fake_lidar_datagram_source.hpp"
+#include "fake_network_preflight.hpp"
 #include "hypertron_ros2_bridge/astrall_sdk.hpp"
 #include "hypertron_ros2_bridge/driver_node.hpp"
 #include "hypertron_ros2_bridge/lidar_stream.hpp"
 #include "hypertron_ros2_bridge/msg/robot_state.hpp"
-#include "fake_astrall_sdk.hpp"
-#include "fake_lidar_datagram_source.hpp"
-#include "fake_network_preflight.hpp"
 
 namespace {
 
 namespace test = hypertron_ros2_bridge::test;
 using hypertron_ros2_bridge::HypertronDriverNode;
 using hypertron_ros2_bridge::IAstrallSdk;
-using hypertron_ros2_bridge::INetworkPreflight;
 using hypertron_ros2_bridge::ImuSample;
-using hypertron_ros2_bridge::msg::RobotState;
+using hypertron_ros2_bridge::INetworkPreflight;
 using hypertron_ros2_bridge::SportSample;
 using hypertron_ros2_bridge::Velocity;
+using hypertron_ros2_bridge::msg::RobotState;
 using test::FakeAstrallSdk;
 using test::FakeLidarDatagramSource;
 using test::FakeNetworkPreflight;
 
-void PutU16(std::vector<std::uint8_t>& b, std::size_t off, std::uint16_t v) {
+void PutU16(std::vector<std::uint8_t> &b, std::size_t off, std::uint16_t v) {
   b[off] = static_cast<std::uint8_t>(v & 0xFFU);
   b[off + 1] = static_cast<std::uint8_t>((v >> 8U) & 0xFFU);
 }
-void PutU32(std::vector<std::uint8_t>& b, std::size_t off, std::uint32_t v) {
+void PutU32(std::vector<std::uint8_t> &b, std::size_t off, std::uint32_t v) {
   for (int i = 0; i < 4; ++i) {
     b[off + static_cast<std::size_t>(i)] =
         static_cast<std::uint8_t>((v >> (8U * i)) & 0xFFU);
   }
 }
-void PutU64(std::vector<std::uint8_t>& b, std::size_t off, std::uint64_t v) {
+void PutU64(std::vector<std::uint8_t> &b, std::size_t off, std::uint64_t v) {
   for (int i = 0; i < 8; ++i) {
     b[off + static_cast<std::size_t>(i)] =
         static_cast<std::uint8_t>((v >> (8U * i)) & 0xFFU);
@@ -76,10 +76,11 @@ void PutU64(std::vector<std::uint8_t>& b, std::size_t off, std::uint64_t v) {
 
 // A complete packed point-cloud packet that reassembles on its own: one
 // packet with total==index_count==1 carrying `points` (pos_num points).
-std::vector<std::uint8_t> MakeWholeCloudPacket(
-    std::uint64_t ts, std::uint32_t total, std::uint32_t index,
-    std::uint16_t pos_num, const std::vector<std::array<int, 4>>& points) {
-  const std::size_t pos_at = 20U;  // packed header; tail after pos_num points
+std::vector<std::uint8_t>
+MakeWholeCloudPacket(std::uint64_t ts, std::uint32_t total, std::uint32_t index,
+                     std::uint16_t pos_num,
+                     const std::vector<std::array<int, 4>> &points) {
+  const std::size_t pos_at = 20U; // packed header; tail after pos_num points
   std::vector<std::uint8_t> b(pos_at + 28U * pos_num + 2U, 0);
   PutU16(b, 0, 0xAA55U);
   PutU64(b, 2, ts);
@@ -88,9 +89,12 @@ std::vector<std::uint8_t> MakeWholeCloudPacket(
   PutU16(b, 18, pos_num);
   for (std::size_t i = 0; i < points.size(); ++i) {
     const std::size_t off = pos_at + i * 28U;
-    PutU32(b, off, static_cast<std::uint32_t>(static_cast<std::int32_t>(points[i][0])));
-    PutU32(b, off + 4, static_cast<std::uint32_t>(static_cast<std::int32_t>(points[i][1])));
-    PutU32(b, off + 8, static_cast<std::uint32_t>(static_cast<std::int32_t>(points[i][2])));
+    PutU32(b, off,
+           static_cast<std::uint32_t>(static_cast<std::int32_t>(points[i][0])));
+    PutU32(b, off + 4,
+           static_cast<std::uint32_t>(static_cast<std::int32_t>(points[i][1])));
+    PutU32(b, off + 8,
+           static_cast<std::uint32_t>(static_cast<std::int32_t>(points[i][2])));
     PutU32(b, off + 12, static_cast<std::uint32_t>(points[i][3]));
   }
   PutU16(b, b.size() - 2U, 0xFF00U);
@@ -98,9 +102,10 @@ std::vector<std::uint8_t> MakeWholeCloudPacket(
 }
 
 // A packed 68-byte odometry datagram.
-std::vector<std::uint8_t> MakeOdometryPacket(
-    std::uint64_t ts, std::int64_t x, std::int64_t y, std::int64_t z,
-    std::int64_t qx, std::int64_t qy, std::int64_t qz, std::int64_t qw) {
+std::vector<std::uint8_t> MakeOdometryPacket(std::uint64_t ts, std::int64_t x,
+                                             std::int64_t y, std::int64_t z,
+                                             std::int64_t qx, std::int64_t qy,
+                                             std::int64_t qz, std::int64_t qw) {
   std::vector<std::uint8_t> b(68U, 0);
   PutU16(b, 0, 0xAA55U);
   PutU64(b, 2, ts);
@@ -139,7 +144,7 @@ rclcpp::NodeOptions test_node_options() {
 // Bounded spin loop that evaluates pred() at least once per iteration up to
 // timeout. Returns true as soon as pred() returns true.
 template <typename Pred>
-bool wait_until(Pred&& pred, std::chrono::milliseconds timeout = kWaitTimeout,
+bool wait_until(Pred &&pred, std::chrono::milliseconds timeout = kWaitTimeout,
                 std::chrono::milliseconds step = std::chrono::milliseconds(5)) {
   const auto deadline = std::chrono::steady_clock::now() + timeout;
   do {
@@ -154,8 +159,8 @@ bool wait_until(Pred&& pred, std::chrono::milliseconds timeout = kWaitTimeout,
 // A live-connected driver node plus raw access to its injected fakes.
 struct Harness {
   std::shared_ptr<HypertronDriverNode> node;
-  FakeAstrallSdk* sdk = nullptr;
-  FakeNetworkPreflight* preflight = nullptr;
+  FakeAstrallSdk *sdk = nullptr;
+  FakeNetworkPreflight *preflight = nullptr;
 
   // The driver node owns the fakes; sdk/preflight point into it via raw
   // pointers captured before ownership transfers. They stay valid for the
@@ -175,17 +180,18 @@ struct Harness {
     }
     p->next_decision.ready = true;
     p->next_decision.message = "fake preflight ready";
-    h.node = std::make_shared<HypertronDriverNode>(
-        test_node_options(), std::move(s), std::move(p));
+    h.node = std::make_shared<HypertronDriverNode>(test_node_options(),
+                                                   std::move(s), std::move(p));
     return h;
   }
 
   // As `make`, but also injects programmatic LiDAR datagram sources so tests
   // can push point-cloud / odometry datagrams directly into the receivers.
-  static Harness make_with_lidar(
-      std::unique_ptr<FakeLidarDatagramSource> point_cloud,
-      std::unique_ptr<FakeLidarDatagramSource> odometry,
-      bool connected) {
+  static Harness
+  make_with_lidar(std::unique_ptr<FakeLidarDatagramSource> point_cloud,
+                  std::unique_ptr<FakeLidarDatagramSource> odometry,
+                  bool connected,
+                  rclcpp::NodeOptions options = test_node_options()) {
     Harness h;
     auto s = std::make_unique<FakeAstrallSdk>();
     auto p = std::make_unique<FakeNetworkPreflight>();
@@ -199,7 +205,7 @@ struct Harness {
     p->next_decision.ready = true;
     p->next_decision.message = "fake preflight ready";
     h.node = std::make_shared<HypertronDriverNode>(
-        test_node_options(), std::move(s), std::move(p), std::move(point_cloud),
+        std::move(options), std::move(s), std::move(p), std::move(point_cloud),
         std::move(odometry));
     return h;
   }
@@ -209,30 +215,29 @@ struct Harness {
 // emits an SDK status report (sets the runtime link/authority caches) and then
 // waits for several heartbeat ticks that also advance state polls, so the
 // first sdk_linked snapshot arms the motion gate.
-void arm_connected(Harness& h,
-                   rclcpp::executors::SingleThreadedExecutor& executor) {
+void arm_connected(Harness &h,
+                   rclcpp::executors::SingleThreadedExecutor &executor) {
   // Wait for the worker to enter a connected session (init+subscribe done).
   ASSERT_TRUE(wait_until([&] { return h.sdk->was_called("heartbeat"); }))
       << "worker never connected (no heartbeat recorded)";
   h.sdk->emit_status(true, true);
   // Advance several heartbeat / state-poll ticks so a live snapshot is polled.
-  ASSERT_TRUE(wait_until([&] {
-    return h.sdk->call_count("heartbeat") >= 5;
-  })) << "state polls did not advance after status report";
+  ASSERT_TRUE(wait_until([&] { return h.sdk->call_count("heartbeat") >= 5; }))
+      << "state polls did not advance after status report";
 }
 
 // Returns the first recorded move() velocity with the given clamped values,
 // or nullopt if none matched within timeout. Spins the executor so the cmd_vel
 // subscription callback is delivered to the driver node on this thread.
-std::optional<Velocity> wait_for_move(
-    Harness& h, rclcpp::executors::SingleThreadedExecutor& executor,
-    std::int32_t vx, std::int32_t vy, std::int32_t vyaw,
-    std::chrono::milliseconds timeout = kWaitTimeout) {
+std::optional<Velocity>
+wait_for_move(Harness &h, rclcpp::executors::SingleThreadedExecutor &executor,
+              std::int32_t vx, std::int32_t vy, std::int32_t vyaw,
+              std::chrono::milliseconds timeout = kWaitTimeout) {
   std::optional<Velocity> out;
   wait_until(
       [&] {
         executor.spin_some();
-        for (const auto& call : h.sdk->calls()) {
+        for (const auto &call : h.sdk->calls()) {
           if (call.method == "move" &&
               static_cast<int>(call.velocity.vx) == vx &&
               static_cast<int>(call.velocity.vy) == vy &&
@@ -247,15 +252,16 @@ std::optional<Velocity> wait_for_move(
   return out;
 }
 
-}  // namespace
+} // namespace
 
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
 
 class DriverNodeTest : public ::testing::Test {
- protected:
-  static void SetUpTestCase() { /* rclcpp initialized in main() */ }
+protected:
+  static void SetUpTestCase() { /* rclcpp initialized in main() */
+  }
   void TearDown() override {
     // Ensure the executor is out of scope before the node so the worker is
     // stopped cleanly.
@@ -373,7 +379,7 @@ TEST_F(DriverNodeTest, CmdVelIsClampedAndDispatched) {
   mode_pub->publish(mode_msg);
   ASSERT_TRUE(wait_until([&] {
     executor.spin_some();
-    for (const auto& call : h.sdk->calls()) {
+    for (const auto &call : h.sdk->calls()) {
       if (call.method == "set_mode" && call.mode == 0xA104U) {
         return true;
       }
@@ -391,8 +397,7 @@ TEST_F(DriverNodeTest, CmdVelIsClampedAndDispatched) {
   bool seen = false;
   do {
     cmd_pub->publish(twist);
-    if (wait_for_move(h, executor, 1, -1, 0,
-                      std::chrono::milliseconds(25))) {
+    if (wait_for_move(h, executor, 1, -1, 0, std::chrono::milliseconds(25))) {
       seen = true;
       break;
     }
@@ -433,7 +438,7 @@ TEST_F(DriverNodeTest, CmdVelNaNIsRejectedNotClamped) {
   mode_pub->publish(mode_msg);
   ASSERT_TRUE(wait_until([&] {
     executor.spin_some();
-    for (const auto& call : h.sdk->calls()) {
+    for (const auto &call : h.sdk->calls()) {
       if (call.method == "set_mode" && call.mode == 0xA104U) {
         return true;
       }
@@ -458,9 +463,9 @@ TEST_F(DriverNodeTest, CmdVelNaNIsRejectedNotClamped) {
   const double nan = std::numeric_limits<double>::quiet_NaN();
 #endif
   const auto baseline = h.sdk->call_count("move");
-  publish_nonfinite(nan, 0.0, 0.0);  // NaN linear.x
-  publish_nonfinite(0.0, nan, 0.0);  // NaN linear.y
-  publish_nonfinite(0.0, 0.0, nan);  // NaN angular.z
+  publish_nonfinite(nan, 0.0, 0.0); // NaN linear.x
+  publish_nonfinite(0.0, nan, 0.0); // NaN linear.y
+  publish_nonfinite(0.0, 0.0, nan); // NaN angular.z
   publish_nonfinite(std::numeric_limits<double>::infinity(), 0.0, 0.0);
   publish_nonfinite(-std::numeric_limits<double>::infinity(), 0.0, 0.0);
   publish_nonfinite(0.0, 0.0, std::numeric_limits<double>::infinity());
@@ -571,8 +576,7 @@ TEST_F(DriverNodeTest, EmergencyStopServiceAnswersTruthfully) {
     executor.add_node(aux);
     executor.spin_some(std::chrono::milliseconds(50));
 
-    auto client =
-        aux->create_client<std_srvs::srv::SetBool>("/emergency_stop");
+    auto client = aux->create_client<std_srvs::srv::SetBool>("/emergency_stop");
     ASSERT_TRUE(client->wait_for_service(std::chrono::milliseconds(500)));
     auto req = std::make_shared<std_srvs::srv::SetBool::Request>();
     req->data = true;
@@ -592,8 +596,7 @@ TEST_F(DriverNodeTest, EmergencyStopServiceAnswersTruthfully) {
 
     auto aux = std::make_shared<rclcpp::Node>("aux_estop_b");
     executor.add_node(aux);
-    auto client =
-        aux->create_client<std_srvs::srv::SetBool>("/emergency_stop");
+    auto client = aux->create_client<std_srvs::srv::SetBool>("/emergency_stop");
     ASSERT_TRUE(client->wait_for_service(std::chrono::milliseconds(500)));
     auto req = std::make_shared<std_srvs::srv::SetBool::Request>();
     req->data = true;
@@ -606,7 +609,7 @@ TEST_F(DriverNodeTest, EmergencyStopServiceAnswersTruthfully) {
     EXPECT_TRUE(wait_until([&] { return h.sdk->was_called("move"); }))
         << "no move was dispatched for the estop";
     EXPECT_TRUE(wait_until([&] {
-      for (const auto& call : h.sdk->calls()) {
+      for (const auto &call : h.sdk->calls()) {
         if (call.method == "move" && call.velocity.vx == 0.0f &&
             call.velocity.vy == 0.0f && call.velocity.vyaw == 0.0f) {
           return true;
@@ -615,7 +618,7 @@ TEST_F(DriverNodeTest, EmergencyStopServiceAnswersTruthfully) {
       return false;
     })) << "estop did not zero velocity";
     EXPECT_TRUE(wait_until([&] {
-      for (const auto& call : h.sdk->calls()) {
+      for (const auto &call : h.sdk->calls()) {
         if (call.method == "set_mode" && call.mode == 0xA101U) {
           return true;
         }
@@ -675,12 +678,13 @@ TEST_F(DriverNodeTest, TfBroadcasterRequiresVerifiedScale) {
   // (a) publish_tf true but scale unverified: no /tf is broadcast.
   {
     rclcpp::NodeOptions opts = test_node_options();
-    opts.parameter_overrides().push_back(rclcpp::Parameter("odom.publish_tf", true));
+    opts.parameter_overrides().push_back(
+        rclcpp::Parameter("odom.publish_tf", true));
     opts.parameter_overrides().push_back(
         rclcpp::Parameter("odometry.scale_verified", false));
     auto s = std::make_unique<FakeAstrallSdk>();
     auto p = std::make_unique<FakeNetworkPreflight>();
-    FakeAstrallSdk* sdk = s.get();
+    FakeAstrallSdk *sdk = s.get();
     s->set_linked(true);
     s->set_authority(true);
     s->set_sport_status(0xB104U);
@@ -718,12 +722,13 @@ TEST_F(DriverNodeTest, TfBroadcasterRequiresVerifiedScale) {
   // (b) Both flags true: an IMU pose produces an odom->base transform.
   {
     rclcpp::NodeOptions opts = test_node_options();
-    opts.parameter_overrides().push_back(rclcpp::Parameter("odom.publish_tf", true));
+    opts.parameter_overrides().push_back(
+        rclcpp::Parameter("odom.publish_tf", true));
     opts.parameter_overrides().push_back(
         rclcpp::Parameter("odometry.scale_verified", true));
     auto s = std::make_unique<FakeAstrallSdk>();
     auto p = std::make_unique<FakeNetworkPreflight>();
-    FakeAstrallSdk* sdk = s.get();
+    FakeAstrallSdk *sdk = s.get();
     s->set_linked(true);
     s->set_authority(true);
     s->set_sport_status(0xB104U);
@@ -790,7 +795,7 @@ TEST_F(DriverNodeTest, ControlAuthorityServiceForwardsResult) {
   EXPECT_TRUE(future.get()->success);
 
   EXPECT_TRUE(wait_until([&] {
-    for (const auto& call : h.sdk->calls()) {
+    for (const auto &call : h.sdk->calls()) {
       if (call.method == "request_authority" && call.authority_sdk) {
         return true;
       }
@@ -808,7 +813,8 @@ TEST_F(DriverNodeTest, LidarPublishersExistByDefault) {
   EXPECT_EQ(graph->count_publishers("/points"), 1U);
   EXPECT_EQ(graph->count_publishers("/odom_lidar"), 1U);
   // The runtime must subscribe LIDAR once per connected session.
-  EXPECT_TRUE(wait_until([&] { return h.sdk->call_count("subscribe_lidar") >= 1; }));
+  EXPECT_TRUE(
+      wait_until([&] { return h.sdk->call_count("subscribe_lidar") >= 1; }));
 }
 
 TEST_F(DriverNodeTest, SdkSubscribesLidarPerSession) {
@@ -821,13 +827,14 @@ TEST_F(DriverNodeTest, SdkSubscribesLidarPerSession) {
   // The default runtime configuration enables the LIDAR stream, so a
   // connected session always subscribes LIDAR.
   ASSERT_TRUE(wait_until([&] { return h.sdk->was_called("heartbeat"); }));
-  EXPECT_TRUE(wait_until([&] { return h.sdk->call_count("subscribe_lidar") >= 1; }));
+  EXPECT_TRUE(
+      wait_until([&] { return h.sdk->call_count("subscribe_lidar") >= 1; }));
 }
 
 TEST_F(DriverNodeTest, PointCloudPacketPublishesPoints) {
   // Inject a fake point-cloud source (odometry source unused here).
   auto pc = std::make_unique<FakeLidarDatagramSource>();
-  FakeLidarDatagramSource* pc_ptr = pc.get();
+  FakeLidarDatagramSource *pc_ptr = pc.get();
   auto odom = std::make_unique<FakeLidarDatagramSource>();
   Harness h = Harness::make_with_lidar(std::move(pc), std::move(odom),
                                        /*connected=*/true);
@@ -871,7 +878,7 @@ TEST_F(DriverNodeTest, PointCloudPacketPublishesPoints) {
     std::lock_guard<std::mutex> lock(points_mutex);
     cloud = *last_cloud;
   }
-  EXPECT_EQ(cloud.header.frame_id, "lidar");
+  EXPECT_EQ(cloud.header.frame_id, "lidar_points");
   EXPECT_EQ(cloud.height, 1U);
   EXPECT_EQ(cloud.width, 2U);
   EXPECT_TRUE(cloud.is_dense);
@@ -888,7 +895,7 @@ TEST_F(DriverNodeTest, PointCloudPacketPublishesPoints) {
   EXPECT_EQ(cloud.fields[3].datatype, sensor_msgs::msg::PointField::UINT32);
   EXPECT_EQ(cloud.fields[3].offset, 12U);
 
-  ASSERT_EQ(cloud.data.size(), 32U);  // 2 points * 16-byte stride
+  ASSERT_EQ(cloud.data.size(), 32U); // 2 points * 16-byte stride
   float x, y, z;
   std::uint32_t rgba;
   std::memcpy(&x, cloud.data.data(), sizeof(float));
@@ -908,7 +915,7 @@ TEST_F(DriverNodeTest, PointCloudPacketPublishesPoints) {
 TEST_F(DriverNodeTest, OdometryPacketPublishesOdomLidar) {
   auto pc = std::make_unique<FakeLidarDatagramSource>();
   auto odom = std::make_unique<FakeLidarDatagramSource>();
-  FakeLidarDatagramSource* odom_ptr = odom.get();
+  FakeLidarDatagramSource *odom_ptr = odom.get();
   Harness h = Harness::make_with_lidar(std::move(pc), std::move(odom),
                                        /*connected=*/true);
   auto aux = std::make_shared<rclcpp::Node>("aux_odom_lidar");
@@ -928,8 +935,8 @@ TEST_F(DriverNodeTest, OdometryPacketPublishesOdomLidar) {
       });
 
   // x=1000000*1e-6=1.0m..., q=(0,0,0,1000000)/1e6 -> (0,0,0,1) normalized.
-  auto packet = MakeOdometryPacket(9ULL, 1000000, 2000000, 3000000,
-                                   0, 0, 0, 1000000);
+  auto packet =
+      MakeOdometryPacket(9ULL, 1000000, 2000000, 3000000, 0, 0, 0, 1000000);
   ASSERT_TRUE(odom_ptr->push(std::move(packet)));
 
   ASSERT_TRUE(wait_until([&] {
@@ -963,13 +970,67 @@ TEST_F(DriverNodeTest, OdometryPacketPublishesOdomLidar) {
   EXPECT_EQ(odom_msg.twist.twist.linear.x, 0.0);
 }
 
+TEST_F(DriverNodeTest, LidarOdometryAndTfUseExactlyTheSameSensorStamp) {
+  rclcpp::NodeOptions opts = test_node_options();
+  opts.parameter_overrides().push_back(
+      rclcpp::Parameter("odom_lidar.publish_tf", true));
+  opts.parameter_overrides().push_back(
+      rclcpp::Parameter("odometry.scale_verified", true));
+
+  auto pc = std::make_unique<FakeLidarDatagramSource>();
+  auto odom = std::make_unique<FakeLidarDatagramSource>();
+  FakeLidarDatagramSource *odom_ptr = odom.get();
+  Harness h = Harness::make_with_lidar(std::move(pc), std::move(odom),
+                                       /*connected=*/true, opts);
+  auto aux = std::make_shared<rclcpp::Node>("aux_lidar_stamp_sync");
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(h.node);
+  executor.add_node(aux);
+
+  std::mutex received_mutex;
+  std::optional<nav_msgs::msg::Odometry> odom_msg;
+  std::optional<geometry_msgs::msg::TransformStamped> lidar_tf;
+  auto odom_sub = aux->create_subscription<nav_msgs::msg::Odometry>(
+      "/odom_lidar", rclcpp::SensorDataQoS(),
+      [&](const nav_msgs::msg::Odometry::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(received_mutex);
+        odom_msg = *msg;
+      });
+  auto tf_sub = aux->create_subscription<tf2_msgs::msg::TFMessage>(
+      "/tf", rclcpp::QoS(rclcpp::KeepLast(10)).reliable(),
+      [&](const tf2_msgs::msg::TFMessage::SharedPtr msg) {
+        std::lock_guard<std::mutex> lock(received_mutex);
+        for (const auto &transform : msg->transforms) {
+          if (transform.header.frame_id == "odom" &&
+              transform.child_frame_id == "lidar") {
+            lidar_tf = transform;
+          }
+        }
+      });
+
+  auto packet = MakeOdometryPacket(123456789ULL, 1000000, 2000000, 3000000, 0,
+                                   0, 0, 1000000);
+  ASSERT_TRUE(odom_ptr->push(std::move(packet)));
+  ASSERT_TRUE(wait_until([&] {
+    executor.spin_some();
+    std::lock_guard<std::mutex> lock(received_mutex);
+    return odom_msg.has_value() && lidar_tf.has_value();
+  })) << "odometry and odom->lidar TF were not both published";
+
+  std::lock_guard<std::mutex> lock(received_mutex);
+  ASSERT_TRUE(odom_msg.has_value());
+  ASSERT_TRUE(lidar_tf.has_value());
+  EXPECT_EQ(odom_msg->header.stamp.sec, lidar_tf->header.stamp.sec);
+  EXPECT_EQ(odom_msg->header.stamp.nanosec, lidar_tf->header.stamp.nanosec);
+}
+
 TEST_F(DriverNodeTest, LidarDisabledPublishesNothing) {
   rclcpp::NodeOptions opts = test_node_options();
   opts.parameter_overrides().push_back(
       rclcpp::Parameter("subscriptions.lidar_enabled", false));
   auto s = std::make_unique<FakeAstrallSdk>();
   auto p = std::make_unique<FakeNetworkPreflight>();
-  FakeAstrallSdk* sdk = s.get();
+  FakeAstrallSdk *sdk = s.get();
   p->next_decision.ready = true;
   p->next_decision.message = "ok";
   auto node =
@@ -998,9 +1059,10 @@ TEST_F(DriverNodeTest, LidarDisabledPublishesNothing) {
 
 // Builds a NodeOptions from the valid test defaults plus the given overrides.
 template <typename... Overrides>
-rclcpp::NodeOptions options_with(Overrides&&... overrides) {
+rclcpp::NodeOptions options_with(Overrides &&...overrides) {
   rclcpp::NodeOptions opts = test_node_options();
-  (opts.parameter_overrides().push_back(std::forward<Overrides>(overrides)), ...);
+  (opts.parameter_overrides().push_back(std::forward<Overrides>(overrides)),
+   ...);
   return opts;
 }
 
@@ -1041,7 +1103,7 @@ TEST_F(DriverNodeTest, F5_InvalidParametersThrowInvalidParametersException) {
   // Sanity: the valid default options still construct and connect.
   auto s = std::make_unique<FakeAstrallSdk>();
   auto p = std::make_unique<FakeNetworkPreflight>();
-  FakeAstrallSdk* sdk = s.get();
+  FakeAstrallSdk *sdk = s.get();
   p->next_decision.ready = true;
   p->next_decision.message = "ok";
   auto node = std::make_shared<HypertronDriverNode>(test_node_options(),
@@ -1054,7 +1116,7 @@ TEST_F(DriverNodeTest, F5_InvalidParametersThrowInvalidParametersException) {
   })) << "valid parameters must still construct and connect";
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   ::testing::InitGoogleTest(&argc, argv);
   rclcpp::init(argc, argv);
   const int result = RUN_ALL_TESTS();

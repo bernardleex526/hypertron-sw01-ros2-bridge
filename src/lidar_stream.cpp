@@ -414,13 +414,21 @@ std::optional<PointCloudFrame> PointCloudFrameAssembler::add_packet(
     ++stats_.packets_rejected;
     return std::nullopt;
   }
-  // Per the manual `index` is the packet sequence number within the frame;
-  // storage is keyed by it, so bound it by max_packets_per_frame to keep
-  // memory bounded. A packet whose index exceeds the cap is rejected (the
-  // 1-based ceiling; the stricter 0-based ceiling is index >= cap and that
-  // value remains bounded but can only ever be valid for a 1-based frame).
-  if (packet.index > config_.max_packets_per_frame) {
-    ++stats_.packets_rejected;
+  // On the real SW01 `index` is the starting point offset within the frame.
+  // A packet whose range lies outside the declared frame is invalid: reject
+  // it if no frame is active, or drop the whole frame if it arrives after a
+  // valid frame has already been accepted.
+  const std::size_t points_here = packet.points.size();
+  const bool range_out_of_frame =
+      packet.index >= packet.total ||
+      static_cast<std::uint64_t>(packet.index) + points_here > packet.total;
+  if (range_out_of_frame) {
+    FrameSlot* existing = slot_for_timestamp(packet.timestamp_ns, false);
+    if (existing != nullptr) {
+      finalize_slot(existing, FinalizeReason::Conflict);
+    } else {
+      ++stats_.packets_rejected;
+    }
     return std::nullopt;
   }
 
@@ -440,11 +448,11 @@ std::optional<PointCloudFrame> PointCloudFrameAssembler::add_packet(
     slot->total = packet.total;
   }
 
-  // Duplicate index: identical content is a harmless duplicate (ignored);
-  // differing content is a conflict that drops the whole frame.
-  if (packet.index < slot->packets.size() &&
-      !slot->packets[packet.index].empty()) {
-    if (slot->packets[packet.index] == packet.points) {
+  // Duplicate starting offset: identical content is a harmless duplicate
+  // (ignored); differing content is a conflict that drops the whole frame.
+  const auto existing = slot->packets.find(packet.index);
+  if (existing != slot->packets.end()) {
+    if (existing->second == packet.points) {
       ++stats_.packets_duplicated;
       return std::nullopt;
     }
@@ -452,69 +460,75 @@ std::optional<PointCloudFrame> PointCloudFrameAssembler::add_packet(
     return std::nullopt;
   }
 
+  // Bound the number of unique packets per frame. This is the memory bound
+  // now that storage is keyed by point offset rather than by a dense packet
+  // sequence index.
+  if (slot->packets.size() >= config_.max_packets_per_frame) {
+    ++stats_.packets_rejected;
+    return std::nullopt;
+  }
+
+  // Reject ranges that overlap an already accepted packet.
+  const auto next = slot->packets.lower_bound(packet.index);
+  if (next != slot->packets.end() &&
+      static_cast<std::uint64_t>(packet.index) + packet.points.size() >
+          next->first) {
+    finalize_slot(slot, FinalizeReason::Conflict);
+    return std::nullopt;
+  }
+  if (next != slot->packets.begin()) {
+    const auto prev = std::prev(next);
+    if (static_cast<std::uint64_t>(prev->first) + prev->second.size() >
+        packet.index) {
+      finalize_slot(slot, FinalizeReason::Conflict);
+      return std::nullopt;
+    }
+  }
+
   // Accumulated point-count budget: accepting this packet must not drive the
   // frame's point total past its declared `total` or past the absolute
   // per-frame cap. Either is a conflicting (inconsistent) frame, dropped.
-  const std::size_t points_here = packet.points.size();
   if (slot->sum_points + points_here > slot->total ||
       slot->sum_points + points_here > config_.max_points_per_frame) {
     finalize_slot(slot, FinalizeReason::Conflict);
     return std::nullopt;
   }
 
-  // Store keyed by the raw packet index (slot 0 is simply unused for a
-  // 1-based frame). The index set bounded by max_packets_per_frame keeps the
-  // slot vector bounded.
-  if (slot->packets.size() <= packet.index) {
-    slot->packets.resize(static_cast<std::size_t>(packet.index) + 1);
-  }
-  slot->packets[packet.index] = packet.points;
+  // Store keyed by the raw starting point offset.
+  slot->packets.emplace(packet.index, packet.points);
   ++slot->unique_indices;
   slot->sum_points += points_here;
   ++stats_.packets_accepted;
 
-  // Completion check. The manually-defined semantics require TWO conditions:
-  //  (1) the observed packet-index set covers contiguously starting from the
-  //      base (index 0 present => 0-based; index 0 absent but index 1 present
-  //      => 1-based), leaving no gap up to the highest observed index;
-  //  (2) the points across those packets sum exactly to the declared total.
-  // The base is never assumed - index 0's presence proves it.
+  // Completion check. A frame is complete when the sorted packet ranges
+  // exactly cover [0, total) with no gaps and no overlaps. Overlaps were
+  // rejected above, so a single ordered scan plus the sum check suffices.
   bool complete = false;
   if (slot->sum_points == slot->total && slot->unique_indices > 0) {
-    // Highest observed index.
-    std::size_t highest = slot->packets.size();
-    while (highest > 0 && slot->packets[highest - 1].empty()) {
-      --highest;
-    }
-    const bool base0 = highest > 0 && !slot->packets[0].empty();
-    const bool base1 = highest > 1 && slot->packets[0].empty() &&
-                       !slot->packets[1].empty();
-    if (base0 || base1) {
-      const std::size_t base = base0 ? 0U : 1U;
-      bool contiguous = true;
-      for (std::size_t i = base; i < highest; ++i) {
-        if (slot->packets[i].empty()) {
-          contiguous = false;
-          break;
-        }
+    std::uint64_t expected = 0;
+    bool contiguous = true;
+    for (const auto& kv : slot->packets) {
+      if (kv.first != expected) {
+        contiguous = false;
+        break;
       }
-      complete = contiguous;
+      expected += kv.second.size();
     }
+    complete = contiguous && expected == slot->total;
   }
 
   if (!complete) {
     return std::nullopt;
   }
 
-  // Emit the frame with points in packet-index order (storage is already
-  // keyed by raw index, so iterating slots 0..size-1 yields index order for
-  // either base).
+  // Emit the frame with points in point-offset order (the map is sorted by
+  // starting offset).
   PointCloudFrame frame;
   frame.timestamp_ns = slot->timestamp_ns;
   frame.total_points = slot->total;
   frame.points.reserve(slot->total);
-  for (std::size_t i = 0; i < slot->packets.size(); ++i) {
-    const auto& pts = slot->packets[i];
+  for (const auto& kv : slot->packets) {
+    const auto& pts = kv.second;
     frame.points.insert(frame.points.end(), pts.begin(), pts.end());
   }
   if (frame.points.size() != slot->total) {

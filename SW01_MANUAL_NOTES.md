@@ -133,12 +133,12 @@ SW 按键位。当前直连驱动不发布设备信息或遥控器输入，但�
 
 - **SOF/TAIL**：头 `0xAA55`、尾 `0xFF00`。
 - **两种布局**：Naturally-packed 头（20 字节头：SOF、64 位时间戳、u32 帧
-  序号 total、u32 数据序号 index、u16 posNum）与 type-aligned 头（28 字节头）。
+  总点数 total、u32 数据序号 index、u16 posNum）与 type-aligned 头（28 字节头）。
 - **尾部两种形态**：动态尾（恰好 `posNum` 个点后接尾标记）与固定 50 点尾
   （`posNum` 个有效点，其余忽略），解析均校验 0xAA55/0xFF00 与长度。
 - 点宽 28 字节：x/y/z `int32` + rgba `uint32`（字节序原样保留，不臆断通道顺序）。
-- 组帧按 `total`（帧总点数）与 `index` 序列，索引集完整且连续覆盖
-  0..total-1 或 1..total 才发布；单包 ≤50 点约束由解析与 `posNum` 校验承担。
+- 组帧按 `total`（帧总点数）与 `index`（本包起始点偏移，实测 0、50、100、...）
+  精确覆盖 `[0, total)` 才发布；单包 ≤50 点约束由解析与 `posNum` 校验承担。
 - **坐标比例**：`point_position_scale` 默认 `1e-3`（`int32` × 1e-3 → 米），
   **未实机标定**，标定前不得当作物理真值。
 

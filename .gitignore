@@ -1,5 +1,6 @@
 # Build artifacts and caches
 build*/
+install/
 __pycache__/
 *.pyc
 .ros/

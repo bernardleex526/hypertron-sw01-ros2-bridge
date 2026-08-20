@@ -91,6 +91,22 @@ def test_documentation_keeps_ros_operating_contract_and_sdk_manual_facts() -> No
         assert token in manual
 
 
+def test_mapping_keeps_point_cloud_and_odometry_frames_distinct() -> None:
+    config = read("config/driver_config.yaml")
+    launch = read("launch/mapping.launch.py")
+    rviz = read("config/points_view.rviz")
+
+    assert 'frame_id: "lidar_points"' in config
+    assert 'child_frame: "lidar"' in config
+    assert "'lidar_points_yaw'" in launch
+    assert "default_value='2.391101075'" in launch
+    assert "'--frame-id', 'lidar', '--child-frame-id', 'lidar_points'" in launch
+    assert "arguments=['-d', pkg + '/config/points_view.rviz']" in launch
+    assert "Fixed Frame: odom" in rviz
+    assert "Target Frame: lidar" in rviz
+    assert "Value: /points_relay" in rviz
+
+
 # ---------------------------------------------------------------------------
 # Direct-driver build contract.
 # ---------------------------------------------------------------------------

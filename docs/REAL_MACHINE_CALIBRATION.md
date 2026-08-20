@@ -90,15 +90,16 @@ sudo tcpdump -i eno1 -w /tmp/odom6101.pcap udp port 6101 -c 500
 
 1. 安装缺失依赖（需管理员）：`sudo apt install ros-humble-pointcloud-to-laserscan`
    （robot_localization 可选，后续里程计融合再用）。
-2. 标定 `lidar→base_link` 外参（B8/B10 的轴向 + 结构尺寸），填入
-   `config/laserscan_converter.yaml` 与 TF 骨架参数后启动：
+2. 复核 `lidar→lidar_points` 轴向和 `lidar→base_link` 外参（B8/B10 的轴向
+   + 结构尺寸）后启动：
    ```bash
    ros2 launch hypertron_ros2_bridge mapping.launch.py \
      enable_tf_skeleton:=true enable_odom_tf:=true
    ```
 3. 低速推/遥操作覆盖环境建图，保存地图，静止漂移与地图一致性验收。
-4. **骨架中的 TF 参数默认是占位值（0,0,0,0,0,0），未标定前禁止开启
-   `enable_tf_skeleton`。**
+4. 当前 `lidar→lidar_points` yaw 使用正前方约 1m 柱子的初验值 `+137°`；
+   `lidar→base_link` 平移使用手册值。正式导航前仍须复核侧向轴、2m/3m
+   距离线性度和雷达光学中心离地高度。
 
 ## F. 导航（Nav2 骨架）
 
@@ -118,9 +119,9 @@ sudo tcpdump -i eno1 -w /tmp/odom6101.pcap udp port 6101 -c 500
 | B4 点比例 | | `lidar.point_position_scale=` | |
 | B5 odom 位置比例 | | `lidar.odom_position_scale=` | |
 | B6/B7 odom 姿态/顺序 | | | |
-| B8 轴向 | | `lidar.frame_id=` 外参 | |
+| B8 轴向 | 正前方柱子在 UDP 6100 原始 XY 方位约 -137°；旋转 +137° 后实机复测 x≈1.025m、y≈0.005m、方位≈0.27° | `lidar.frame_id=lidar_points`；`lidar→lidar_points yaw=2.391101075rad`；Y 轴仍需侧向目标复核 | 2026-08-18 |
 | B9 index 基 | | | |
 | B10 雷达数 | | | |
 | B11 6101 参考系 | | `odom_lidar.child_frame=` | |
-| B12 设备时钟 | | | |
+| B12 设备时钟 | `/tmp/lidar_known.pcap` 与 `/tmp/odom_forward.pcap` 中6100/6101均为设备启动后的单调纳秒；两路换算到抓包主机时钟的首包offset仅差约1.4ms，非Unix时间 | 驱动以6101接收时刻估计设备时钟到ROS时钟offset，6100复用该映射；仍需重启后和长时间漂移验收 | 2026-08-19 |
 | B13 丢包率 | | | |

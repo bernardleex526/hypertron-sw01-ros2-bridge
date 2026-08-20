@@ -167,13 +167,14 @@ setarch -R build-tsan/test_direct_driver_runtime --gtest_brief=1
 | 发布 | `/imu/data` | `sensor_msgs/Imu`，SensorDataQoS | 含可配协方差、四元数顺序（默认 xyzw） |
 | 发布 | `/odom` | `nav_msgs/Odometry`，SensorDataQoS | **仅诊断**：IMU 的 odomX/odomY 映射，twist 全 0 |
 | 发布 | `/robot_state` | `RobotState`，KeepLast(10) reliable + transient_local | 连接/授权/急停/系统/电池/模式/轮速/错误；连接期间约 2Hz，状态变化和断线告警即时发布 |
-| 发布 | `/points` | `sensor_msgs/PointCloud2`（PointXYZRGBA），SensorDataQoS | UDP 6100 点云，整帧重组后发布；**比例未实机标定** |
-| 发布 | `/odom_lidar` | `nav_msgs/Odometry`，SensorDataQoS | UDP 6101 里程计；**未标定，不发布任何 TF** |
+| 发布 | `/points` | `sensor_msgs/PointCloud2`（PointXYZRGBA），SensorDataQoS | UDP 6100 点云，frame=`lidar_points`；约 1m 柱子复核距离约 1.022m，需 `lidar→lidar_points` 轴向 TF |
+| 发布 | `/odom_lidar` | `nav_msgs/Odometry`，SensorDataQoS | UDP 6101 里程计，child=`lidar`；仅在显式开启且 `odometry.scale_verified=true` 时发布 TF |
 | 服务 | `/emergency_stop` | `std_srvs/SetBool` | true=锁存软件急停+零速+阻尼；false=仅清除锁存 |
 | 服务 | `/control_authority` | `std_srvs/SetBool` | true=申请 SDK 控制权；false=交还遥控器 |
 
-不发布 `/joint_states`；默认不发 odom→base TF（`odom.publish_tf=false` 且
-`odometry.scale_verified=false`）。
+不发布 `/joint_states`；默认不发 odom→base TF（`odom.publish_tf=false`）。
+实机配置已将 `odometry.scale_verified=true`，但 `odom_lidar.publish_tf` 仍默认 false，
+只由 `mapping.launch.py enable_odom_tf:=true` 显式开启。
 
 ## 8. 完整实机 SOP（按阶段执行，禁止跳阶段）
 
@@ -207,8 +208,8 @@ sudo tcpdump -i eno1 -w /tmp/odom6101.pcap udp port 6101 -c 500
 odom 位置比例、四元数顺序、轴向、包序号基、单/双雷达、6101 参考系、设备
 时间戳、丢包率。**涉及推动机器人的测量必须在安全三前提下进行。**
 
-> 当前代码的 6100 字段语义和 RGBA 处理仍是未实机验证的假设，见第 9 节；
-> 标定未完成前，`/points`、`/odom_lidar`、`/scan` 都不得进入定位/导航闭环。
+> 6100 的 `total/index` 语义、点比例及正前方轴向已经实机初验；RGBA 完整语义、
+> 侧向轴符号、雷达高度和多距离线性度仍需继续验证，见第 9 节。
 
 ### 阶段 C：参数回填与复测
 
@@ -217,6 +218,7 @@ odom 位置比例、四元数顺序、轴向、包序号基、单/双雷达、61
 - `lidar.point_position_scale` / `lidar.odom_position_scale` /
   `lidar.odom_quaternion_scale`；
 - `lidar.frame_id`、`odom_lidar.parent_frame/child_frame`；
+- `mapping.launch.py` 的 `lidar_points_yaw`（当前柱子初验值 `2.391101075rad`）；
 - `frames.imu/odom/base`（本版本起真正生效）。
 
 重启驱动复测：静止 60s 漂移、直线误差（建议 ±2%）、旋转误差（建议 ±2°）达标
@@ -242,16 +244,21 @@ ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{linear: {x: 0.2}, angul
 ### 阶段 E：建图（SLAM 骨架）
 
 ```bash
-# 标定 lidar→base_link 外参并回填 config/laserscan_converter.yaml 后：
+# 标定 lidar→lidar_points 轴向、lidar→base_link 外参并回填后：
 # 若使用 /odom_lidar 作为里程计 TF，还需要 enable_odom_tf:=true
 ros2 launch hypertron_ros2_bridge mapping.launch.py \
   enable_tf_skeleton:=true enable_odom_tf:=true
 ```
 
-> ⚠️ `enable_tf_skeleton` 默认 **false**；其静态 TF 参数为占位值
-> (0,0,0,0,0,0)，**未标定外参前严禁开启**。注意当前骨架还没有
-> odom→base_link 的定位 TF 源；slam_toolbox 需要该 TF，后续需接
-> robot_localization 或标定后的里程计源才能实际成图。
+> ⚠️ `enable_tf_skeleton` 默认 **false**。当前 `lidar→lidar_points` yaw 来自
+> 正前方约 1m 柱子初验，`lidar→base_link` 平移来自手册；正式导航前仍需侧向
+> 目标、雷达离地高度和多距离复核。`enable_odom_tf:=true` 会使用标定后的 6101
+> 里程计补齐 `odom→lidar→base_link`。
+>
+> 2026-08-18 实机复测中，柱子在 body-aligned `lidar` frame 为
+> `x≈1.025m, y≈0.005m`。点云自身 Z 范围约 `-0.043～0.695m`，没有明显地面
+> 回波；叠加 `odom→lidar.z≈0.417m` 后点云高于 RViz Grid 是预期显示。
+> 未实测雷达光学中心离地高度前，不得为了贴 Grid 直接下移点云。
 
 ### 阶段 F：导航（Nav2 骨架）
 
@@ -282,9 +289,10 @@ mapping.launch 提供 map→odom 定位。）
 以下问题涉及厂商协议字段、频率和比例，本版本**有意未改代码**，必须通过
 `interface.h`、SDK 文档和实机抓包确认后再处理：
 
-1. **UDP 6100 字段语义未证实**：当前解析把 offset 10 当作“帧总点数”、
-   offset 14 当作“包序号”；手册笔记写的是“帧序号、数据序号”。若实机
-   offset 10 是帧序号，现有组帧算法将无法发布 `/points`。
+1. **UDP 6100 字段语义已按实机抓包确认**：offset 10 是帧总点数，offset 14
+   是本包在帧内的起始点偏移（实测 0、50、100、...），不是包序号；组帧按
+   点区间精确覆盖 `[0, total)` 完成。若后续固件/型号改为其他语义，需要重新
+   标定并调整 `PointCloudFrameAssembler`。
 2. **UDP 6100 RGBA 发布仍只使用第一个 uint32**：解析层已保留全部 4 个
    uint32 通道（`rgba_channels`），但 `/points` 为兼容 PointXYZRGBA 仍只把
    第一个通道发布为 `rgba`；如需完整颜色/强度映射，需按真实结构在
@@ -303,14 +311,17 @@ mapping.launch 提供 map→odom 定位。）
    等待较久。需要 SDK 实测延迟后决定是否拆分线程或收紧超时。
 8. **`max_packets_per_frame` 默认已调整为 40000**：可组满 2,000,000 点
    （50 点/包）。实机点云规模确认后仍需按实际值回填。
-9. **SLAM/Nav2 仍是待标定骨架**：已增加 `odom_lidar.publish_tf`、
+9. **SLAM/Nav2 仍是待完整验收骨架**：已增加 `odom_lidar.publish_tf`、
    `mapping.launch.py enable_odom_tf` 和 `navigation.launch.py use_amcl`
-   支持，但 `pointcloud_to_laserscan`、slam_toolbox、Nav2 参数仍为占位值，
-   且必须完成外参/里程计标定后才能得到可用地图/导航。
+   支持；点云已拆分为 `lidar_points`，正前方柱子给出 `+137°` yaw 修正。
+   仍需用侧向目标复核 Y 轴、实测雷达高度、复核 2m/3m 距离，并调整
+   pointcloud_to_laserscan、slam_toolbox、Nav2 参数后才能验收地图/导航。
 10. **相机 H.264（UDP 6000）未实现**；`/joint_commands` 恒拒绝、无
     `/joint_states`。
-11. **本版本未做 ROS/SDK 实机构建验证**：修复后需在目标机器重新跑第 6 节
-    测试、ASan/UBSan/TSAN 抽查与 launch 存活冒烟。
+11. **2026-08-18 已完成本机 ROS/SDK 构建与只读实机冒烟**：`colcon build`
+    成功，CTest（含 UDP loopback）通过，`/points_relay` 与 `/scan` 均约
+    10.28Hz；这仍不等于 SLAM 地图质量、实时性或 Nav2 运动安全验收，后者须按
+    第 8 节分阶段完成。
 
 ## 10. 故障排查
 
@@ -325,6 +336,9 @@ mapping.launch 提供 map→odom 定位。）
 
 ## 参考资料
 
+- [2026-08-20 更新说明与参数详情](docs/UPDATE_2026-08-20_MAPPING_SYNC.md)：Odin1点云标定、设备时间同步、queue修复、参数差异和实机验证
+- [slam_toolbox 参数说明](docs/SLAM_TOOLBOX_PARAMETER_GUIDE.md)：全部主要建图/回环/扫描匹配参数的意义和调节影响
+- [SW01/Odin1 建图导航SOP](docs/SOP_SW01_ODIN1_MAPPING_NAVIGATION.md)：当前进度、全流程命令和后续验收
 - [SW01 手册摘要](SW01_MANUAL_NOTES.md)：SDK API、返回码、UDP 6000/6100/6101 结构
 - [实机标定 Runbook](docs/REAL_MACHINE_CALIBRATION.md)：13 项标定矩阵与记录表
 - [实现与安全评审](REVIEW.md)：任务状态、验证矩阵、遗留项

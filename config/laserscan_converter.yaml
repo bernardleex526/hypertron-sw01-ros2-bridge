@@ -9,7 +9,8 @@
 pointcloud_to_laserscan:
   ros__parameters:
     # 把点云变换到哪个目标 frame。占位值 —— 实机标定后回填。
-    # 需 base_link→lidar 静态 TF 就绪（enable_tf_skeleton 开启后的 TF）。
+    # 需 lidar→lidar_points 轴向修正与 lidar→base_link 外参就绪
+    #（enable_tf_skeleton 开启后的 TF）。
     target_frame: "base_link"
 
     # 高度裁剪（米）：只投影该高度带内的点成 2D 激光。占位值，B8/B10 后回填。
@@ -26,9 +27,10 @@ pointcloud_to_laserscan:
     range_max: 12.0
     scan_time: 0.1
 
-    # 变换查找超时 / 入队缓冲。占位值。
-    transform_tolerance: 0.1
-    queue_size: 10
+    # 变换查找超时 / 入队缓冲。时间同步后通常无需等满 0.3 s；该裕量用于
+    # 吸收 UDP 6100 组帧、6101 TF 与 ROS 调度的短时抖动。
+    transform_tolerance: 0.3
+    queue_size: 50
 
     # 越界时以 inf 表达（true）或丢弃（false）；inf_epsilon 为量化裕度。
     use_inf: true
